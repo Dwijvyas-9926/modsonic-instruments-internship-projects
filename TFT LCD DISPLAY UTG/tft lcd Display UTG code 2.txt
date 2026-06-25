@@ -1,0 +1,890 @@
+#define F_CPU 24000000UL
+#include <avr/io.h>
+#include <avr/pgmspace.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include "logo_data.h"
+#include "font_data.h"
+#include "smallfont_data.h"
+#include "splash_data.h"
+
+/* ================================================================
+   MODSONIC EDISON-II  —  Instrument + Diagnostic Panel
+   AVR128DA48 @ 24MHz  |  ST7789VI 320x240  |  TTP229 8-key
+
+   FLOW:
+     Power on → EDISON II splash → fade → INSTRUMENT UI
+     KEY 8 (any time) → DIAGNOSTIC MODE (HMI panel)
+     KEY 6 from diag menu → back to INSTRUMENT UI
+
+   KEYS in instrument mode:
+     K1 +1   K2 -1   K3 +10  K4 -10
+     K5 +100 K6 -100 K7 reset count   K8 → diag mode
+   ================================================================ */
+
+/* ── Pins ──────────────────────────────────────────── */
+#define DC_LO      (PORTD.OUTCLR = PIN0_bm)
+#define DC_HI      (PORTD.OUTSET = PIN0_bm)
+#define RST_LO     (PORTD.OUTCLR = PIN1_bm)
+#define RST_HI     (PORTD.OUTSET = PIN1_bm)
+#define CS_LO      (PORTD.OUTCLR = PIN2_bm)
+#define CS_HI      (PORTD.OUTSET = PIN2_bm)
+#define TTP_SCL_HI (PORTB.OUTSET = PIN1_bm)
+#define TTP_SCL_LO (PORTB.OUTCLR = PIN1_bm)
+#define TTP_SDO    (PORTB.IN & PIN0_bm)
+
+/* ================================================================
+   SHARED PALETTE
+   ================================================================ */
+/* Instrument UI colours — matches diagnostic palette */
+#define WHITE     0xFFFF
+#define BLACK     0x0000
+#define I_BG      0xFFFF   /* white background                   */
+#define I_TOPFILL C_TBFILL /* light grey top bar                 */
+#define I_RULE    C_RULE   /* visible divider                    */
+#define I_DARK    C_DARK   /* near-black text / digits           */
+#define I_MID     C_MID    /* muted text                         */
+#define I_BLUE    C_BLUE   /* accent                             */
+#define I_BAT_OK  0x04BF   /* battery fill — blue when OK        */
+#define I_BAT_LOW 0xF800   /* battery fill — red when low        */
+#define GREEN     0x07E0   /* kept for compatibility             */
+#define RED       0xF800
+#define SEP_COL   C_RULE
+
+/* Diagnostic UI colours */
+#define C_WHITE   0xFFFF
+#define C_DARK    0x2104
+#define C_MID     0x4208
+#define C_LIGHT   0xCEFF
+#define C_RULE    0xA534
+#define C_TBFILL  0xE71C
+#define C_BLUE    0x04BF
+
+/* ── Instrument layout ─────────────────────────────── */
+#define SCR_W   320
+#define SCR_H   240
+#define TB_H     20   /* shared with diagnostic              */
+#define HB_H     20   /* hint bar at bottom                  */
+#define SEP_Y    TB_H /* separator = bottom of top bar       */
+#define DIG_Y    80   /* digits centred in content area      */
+#define D0_X     18
+#define D1_X     86
+#define D2_X    166
+#define D3_X    234
+#define COL_X   148
+#define COL_Y1  104
+#define COL_Y2  134
+#define COL_SZ   12
+#define BOX_X    10
+#define BOX_Y    66
+#define BOX_W   300
+#define BOX_H   118
+#define BOX_T     1
+#define BAT_X   244   /* battery in top bar                  */
+#define BAT_Y     5
+#define PCT_X   258   /* kept for smfont compat              */
+#define PCT_Y    32
+#define PCT_W    48
+
+/* ── Diagnostic layout (CA_Y/CA_H/HB_Y use TB_H/HB_H from above) ── */
+#define CA_Y   TB_H
+#define CA_H   (SCR_H - TB_H - HB_H)
+#define HB_Y   (SCR_H - HB_H)
+
+/* ── Diagnostic screen IDs ─────────────────────────── */
+#define SCR_DMENU    0
+#define SCR_BRIGHT   1
+#define SCR_BTNTEST  2
+#define SCR_VOLUME   3
+#define SCR_ABOUT    4
+
+/* ── Shared state ──────────────────────────────────── */
+static uint8_t  mode       = 0;    /* 0=instrument  1=diagnostic  */
+static uint8_t  prev_keys  = 0;
+static uint32_t uptime     = 0;    /* 30ms ticks                  */
+static uint16_t key_cnt[8];
+static uint8_t  key_hold[8];
+
+/* ── Instrument state ──────────────────────────────── */
+static uint8_t  sp_row[SP_BPR];
+static uint16_t inst_count = 0;
+static uint8_t  inst_batt  = 100;
+static uint8_t  p0=0xFF,p1=0xFF,p2=0xFF,p3=0xFF,pc=0xFF;
+
+/* ── Diagnostic state ──────────────────────────────── */
+static uint8_t  diag_page  = SCR_DMENU;
+static uint8_t  menu_cur   = 0;
+static uint8_t  bright_val = 10;
+static uint8_t  vol_val    = 60;
+static uint8_t  prev_disp  = 0;
+
+/* ================================================================
+   SPI + LCD PRIMITIVES  (shared by both UIs)
+   ================================================================ */
+static void spi_tx(uint8_t d){
+    SPI0.DATA=d; while(!(SPI0.INTFLAGS&SPI_IF_bm));
+}
+static void lcd_cmd(uint8_t c){ CS_LO;DC_LO;spi_tx(c);CS_HI; }
+static void lcd_dat(uint8_t d){ CS_LO;DC_HI;spi_tx(d);CS_HI; }
+static void win(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1){
+    lcd_cmd(0x2A);lcd_dat(x0>>8);lcd_dat(x0);lcd_dat(x1>>8);lcd_dat(x1);
+    lcd_cmd(0x2B);lcd_dat(y0>>8);lcd_dat(y0);lcd_dat(y1>>8);lcd_dat(y1);
+    lcd_cmd(0x2C);
+}
+static void fill(uint16_t x,uint16_t y,uint16_t w,uint16_t h,uint16_t c){
+    if(!w||!h) return;
+    win(x,y,x+w-1,y+h-1); CS_LO; DC_HI;
+    for(uint32_t i=0;i<(uint32_t)w*h;i++){spi_tx(c>>8);spi_tx(c);}
+    CS_HI;
+}
+static void hline(uint16_t x,uint16_t y,uint16_t w,uint16_t c){fill(x,y,w,1,c);}
+static void vline(uint16_t x,uint16_t y,uint16_t h,uint16_t c){fill(x,y,1,h,c);}
+
+static void lcd_init(void){
+    RST_HI;_delay_ms(50);RST_LO;_delay_ms(50);RST_HI;_delay_ms(200);
+    lcd_cmd(0x11);_delay_ms(120);
+    lcd_cmd(0x36);lcd_dat(0x60); lcd_cmd(0x3A);lcd_dat(0x55);
+    lcd_cmd(0xB2);lcd_dat(0x0C);lcd_dat(0x0C);lcd_dat(0x00);
+                  lcd_dat(0x33);lcd_dat(0x33);
+    lcd_cmd(0xB7);lcd_dat(0x35); lcd_cmd(0xBB);lcd_dat(0x19);
+    lcd_cmd(0xC0);lcd_dat(0x2C); lcd_cmd(0xC2);lcd_dat(0x01);
+    lcd_cmd(0xC3);lcd_dat(0x12); lcd_cmd(0xC4);lcd_dat(0x20);
+    lcd_cmd(0xC6);lcd_dat(0x0F); lcd_cmd(0xD0);lcd_dat(0xA4);lcd_dat(0xA1);
+    lcd_cmd(0xE0);
+    lcd_dat(0xD0);lcd_dat(0x04);lcd_dat(0x0D);lcd_dat(0x11);
+    lcd_dat(0x13);lcd_dat(0x2B);lcd_dat(0x3F);lcd_dat(0x54);
+    lcd_dat(0x4C);lcd_dat(0x18);lcd_dat(0x0D);lcd_dat(0x0B);
+    lcd_dat(0x1F);lcd_dat(0x23);
+    lcd_cmd(0xE1);
+    lcd_dat(0xD0);lcd_dat(0x04);lcd_dat(0x0C);lcd_dat(0x11);
+    lcd_dat(0x13);lcd_dat(0x2C);lcd_dat(0x3F);lcd_dat(0x44);
+    lcd_dat(0x51);lcd_dat(0x2F);lcd_dat(0x1F);lcd_dat(0x1F);
+    lcd_dat(0x20);lcd_dat(0x23);
+    lcd_cmd(0x21); lcd_cmd(0x35);lcd_dat(0x00);
+    lcd_cmd(0x29);_delay_ms(50);
+}
+static void apply_bright(uint8_t lv){
+    lcd_cmd(0x53);lcd_dat(0x2C);
+    lcd_cmd(0x51);lcd_dat((uint8_t)((uint16_t)lv*255/15));
+}
+static void delay_ms(uint16_t ms){
+    while(ms>=100){_delay_ms(100);ms-=100;}
+    while(ms>=10) {_delay_ms(10); ms-=10; }
+    while(ms>=1)  {_delay_ms(1);  ms-=1;  }
+}
+
+/* ================================================================
+   TTP229
+   ================================================================ */
+static uint8_t ttp_read(void){
+    uint8_t k=0;
+    for(uint8_t i=0;i<8;i++){
+        TTP_SCL_LO;_delay_us(3);
+        if(!TTP_SDO) k|=(1<<i);
+        TTP_SCL_HI;_delay_us(3);
+    }
+    for(uint8_t i=0;i<8;i++){TTP_SCL_LO;_delay_us(3);TTP_SCL_HI;_delay_us(3);}
+    return k;
+}
+
+/* ================================================================
+   FONT  5x7, scalable, full ASCII 32-126
+   ================================================================ */
+static const uint8_t FONT[95][7] PROGMEM = {
+{0x00,0x00,0x00,0x00,0x00,0x00,0x00},{0x04,0x04,0x04,0x04,0x00,0x00,0x04},
+{0x0A,0x0A,0x00,0x00,0x00,0x00,0x00},{0x0A,0x1F,0x0A,0x0A,0x1F,0x0A,0x00},
+{0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04},{0x18,0x19,0x02,0x04,0x08,0x13,0x03},
+{0x0C,0x12,0x14,0x08,0x15,0x12,0x0D},{0x04,0x04,0x00,0x00,0x00,0x00,0x00},
+{0x02,0x04,0x08,0x08,0x08,0x04,0x02},{0x08,0x04,0x02,0x02,0x02,0x04,0x08},
+{0x00,0x04,0x15,0x0E,0x15,0x04,0x00},{0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
+{0x00,0x00,0x00,0x00,0x06,0x04,0x08},{0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
+{0x00,0x00,0x00,0x00,0x00,0x06,0x06},{0x01,0x01,0x02,0x04,0x08,0x10,0x10},
+{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+{0x0E,0x11,0x01,0x06,0x08,0x10,0x1F},{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
+{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},{0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},{0x0E,0x11,0x11,0x0F,0x01,0x11,0x0E},
+{0x00,0x06,0x06,0x00,0x06,0x06,0x00},{0x00,0x06,0x06,0x00,0x06,0x04,0x08},
+{0x01,0x02,0x04,0x08,0x04,0x02,0x01},{0x00,0x00,0x1F,0x00,0x1F,0x00,0x00},
+{0x10,0x08,0x04,0x02,0x04,0x08,0x10},{0x0E,0x11,0x01,0x06,0x04,0x00,0x04},
+{0x0E,0x11,0x01,0x0D,0x15,0x15,0x0E},{0x04,0x0A,0x11,0x11,0x1F,0x11,0x11},
+{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
+{0x1C,0x12,0x11,0x11,0x11,0x12,0x1C},{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
+{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},{0x0E,0x11,0x10,0x10,0x13,0x11,0x0E},
+{0x11,0x11,0x11,0x1F,0x11,0x11,0x11},{0x0E,0x04,0x04,0x04,0x04,0x04,0x0E},
+{0x07,0x02,0x02,0x02,0x02,0x12,0x0C},{0x11,0x12,0x14,0x18,0x14,0x12,0x11},
+{0x10,0x10,0x10,0x10,0x10,0x10,0x1F},{0x11,0x1B,0x15,0x11,0x11,0x11,0x11},
+{0x11,0x11,0x19,0x15,0x13,0x11,0x11},{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
+{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},{0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},
+{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},{0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E},
+{0x1F,0x04,0x04,0x04,0x04,0x04,0x04},{0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
+{0x11,0x11,0x11,0x11,0x11,0x0A,0x04},{0x11,0x11,0x11,0x15,0x15,0x1B,0x11},
+{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},{0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
+{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},{0x0E,0x08,0x08,0x08,0x08,0x08,0x0E},
+{0x10,0x10,0x08,0x04,0x02,0x01,0x01},{0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
+{0x04,0x0A,0x11,0x00,0x00,0x00,0x00},{0x00,0x00,0x00,0x00,0x00,0x00,0x1F},
+{0x08,0x04,0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F},
+{0x10,0x10,0x1C,0x12,0x11,0x11,0x1E},{0x00,0x00,0x0E,0x10,0x10,0x11,0x0E},
+{0x01,0x01,0x0F,0x11,0x11,0x11,0x0F},{0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E},
+{0x06,0x09,0x08,0x1C,0x08,0x08,0x08},{0x00,0x0F,0x11,0x11,0x0F,0x01,0x0E},
+{0x10,0x10,0x16,0x19,0x11,0x11,0x11},{0x04,0x00,0x0C,0x04,0x04,0x04,0x0E},
+{0x02,0x00,0x06,0x02,0x02,0x12,0x0C},{0x10,0x10,0x11,0x12,0x1C,0x12,0x11},
+{0x0C,0x04,0x04,0x04,0x04,0x04,0x0E},{0x00,0x00,0x1A,0x15,0x15,0x11,0x11},
+{0x00,0x00,0x16,0x19,0x11,0x11,0x11},{0x00,0x00,0x0E,0x11,0x11,0x11,0x0E},
+{0x00,0x1E,0x11,0x11,0x1E,0x10,0x10},{0x00,0x0F,0x11,0x11,0x0F,0x01,0x01},
+{0x00,0x00,0x16,0x19,0x10,0x10,0x10},{0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E},
+{0x08,0x08,0x1C,0x08,0x08,0x09,0x06},{0x00,0x00,0x11,0x11,0x11,0x13,0x0D},
+{0x00,0x00,0x11,0x11,0x11,0x0A,0x04},{0x00,0x00,0x11,0x11,0x15,0x15,0x0A},
+{0x00,0x00,0x11,0x0A,0x04,0x0A,0x11},{0x00,0x11,0x11,0x0F,0x01,0x11,0x0E},
+{0x00,0x00,0x1F,0x02,0x04,0x08,0x1F},{0x02,0x04,0x04,0x08,0x04,0x04,0x02},
+{0x04,0x04,0x04,0x00,0x04,0x04,0x04},{0x08,0x04,0x04,0x02,0x04,0x04,0x08},
+{0x00,0x08,0x15,0x02,0x00,0x00,0x00},
+};
+static void glyph(uint16_t x,uint16_t y,char c,
+                  uint16_t fg,uint16_t bg,uint8_t sc){
+    if(c<32||c>126){fill(x,y,5*sc,7*sc,bg);return;}
+    for(uint8_t r=0;r<7;r++){
+        uint8_t b=pgm_read_byte(&FONT[(uint8_t)(c-32)][r]);
+        for(uint8_t col=0;col<5;col++)
+            fill(x+col*sc,y+r*sc,sc,sc,(b&(0x10>>col))?fg:bg);
+    }
+}
+static void dtext(uint16_t x,uint16_t y,const char*s,
+                  uint16_t fg,uint16_t bg,uint8_t sc){
+    while(*s){glyph(x,y,*s,fg,bg,sc);x+=(uint16_t)(5+1)*sc;s++;}
+}
+static void numw(uint16_t x,uint16_t y,uint16_t n,uint8_t d,
+                 uint16_t fg,uint16_t bg,uint8_t sc){
+    char b[6]; uint8_t i=d; b[i]=0;
+    while(i--){b[i]=(char)('0'+n%10);n/=10;}
+    dtext(x,y,b,fg,bg,sc);
+}
+/* Bold: draw glyph then overdraw 1px right — thickens strokes */
+static void glyph_bold(uint16_t x,uint16_t y,char c,
+                       uint16_t fg,uint16_t bg,uint8_t sc){
+    if(c<32||c>126){fill(x,y,(5+1)*sc,7*sc,bg);return;}
+    /* background first */
+    fill(x,y,(5+1)*sc,7*sc,bg);
+    for(uint8_t r=0;r<7;r++){
+        uint8_t b=pgm_read_byte(&FONT[(uint8_t)(c-32)][r]);
+        for(uint8_t col=0;col<5;col++){
+            if(b&(0x10>>col)){
+                fill(x+col*sc,    y+r*sc,sc,sc,fg);
+                fill(x+col*sc+1,  y+r*sc,sc,sc,fg); /* +1px bold stroke */
+            }
+        }
+    }
+}
+static void dtext_bold(uint16_t x,uint16_t y,const char*s,
+                       uint16_t fg,uint16_t bg,uint8_t sc){
+    while(*s){glyph_bold(x,y,*s,fg,bg,sc);x+=(uint16_t)(5+2)*sc;s++;}
+}
+static void numw_bold(uint16_t x,uint16_t y,uint16_t n,uint8_t d,
+                      uint16_t fg,uint16_t bg,uint8_t sc){
+    char b[6]; uint8_t i=d; b[i]=0;
+    while(i--){b[i]=(char)('0'+n%10);n/=10;}
+    dtext_bold(x,y,b,fg,bg,sc);
+}
+
+/* ================================================================
+   ██  INSTRUMENT UI  ██
+   ================================================================ */
+static void inst_fill(uint16_t x,uint16_t y,uint16_t w,uint16_t h,uint16_t c){
+    fill(x,y,w,h,c);
+}
+static void draw_logo(void){
+    win(8,6,8+LOGO_W-1,6+LOGO_H-1); CS_LO; DC_HI;
+    for(uint16_t i=0;i<LOGO_W*LOGO_H;i++){
+        uint16_t px=pgm_read_word(&logo[i]);
+        spi_tx(px>>8);spi_tx(px);
+    }
+    CS_HI;
+}
+
+/* Top bar — matches diagnostic style exactly */
+static void draw_inst_topbar(void){
+    fill(0,0,SCR_W,TB_H,I_TOPFILL);
+    hline(0,TB_H-1,SCR_W,I_BLUE);
+    /* logo sits in the top bar */
+    draw_logo();
+    /* battery label */
+    dtext(220,6,"BAT",I_MID,I_TOPFILL,1);
+}
+
+/* Battery: thin outlined bar in top bar area, right side */
+static void draw_battery_border(void){
+    /* body */
+    fill(244,5,46,12,I_TOPFILL);
+    hline(244,5,46,I_RULE); hline(244,16,46,I_RULE);
+    fill(244,5,1,12,I_RULE); fill(289,5,1,12,I_RULE);
+    /* nub */
+    fill(290,8,3,6,I_RULE);
+}
+static void draw_battery(uint8_t pct){
+    uint16_t bc=(pct>30)?I_BAT_OK:I_BAT_LOW;
+    uint16_t tc=(pct>30)?C_DARK:I_BAT_LOW;
+    uint16_t bw=(uint16_t)(43*pct/100);
+    if(bw>43)bw=43;
+    /* bar */
+    fill(245,6,43,10,I_TOPFILL);
+    if(bw>0) fill(245,6,bw,10,bc);
+    /* bold scale-1 with +1 overdraw — larger, bolder, dark */
+    fill(291,3,30,16,I_TOPFILL);
+    if(pct>=100){
+        numw_bold(291,4,100,3,tc,I_TOPFILL,1);
+    } else if(pct>=10){
+        numw_bold(291,4,pct,2,tc,I_TOPFILL,1);
+        dtext_bold(304,4,"%",tc,I_TOPFILL,1);
+    } else {
+        numw_bold(298,4,pct,1,tc,I_TOPFILL,1);
+        dtext_bold(304,4,"%",tc,I_TOPFILL,1);
+    }
+}
+
+static void draw_digit(uint16_t x,uint16_t y,uint8_t d,uint16_t fg,uint16_t bg){
+    uint16_t base=(uint16_t)d*DIG_BPD;
+    win(x,y,x+DIG_W-1,y+DIG_H-1); CS_LO; DC_HI;
+    for(uint8_t row=0;row<DIG_H;row++)
+        for(uint8_t col=0;col<DIG_W;col++){
+            uint16_t bi=base+(uint16_t)row*DIG_BPR+(col>>3);
+            uint8_t  bv=pgm_read_byte(&dfont[bi]);
+            uint16_t c=(bv&(0x80>>(col&7)))?fg:bg;
+            spi_tx(c>>8);spi_tx(c);
+        }
+    CS_HI;
+}
+static void draw_colon(uint16_t color){
+    fill(COL_X,COL_Y1,COL_SZ,COL_SZ,color);
+    fill(COL_X,COL_Y2,COL_SZ,COL_SZ,color);
+}
+
+/* Battery % small font — no longer needed in old position, kept for smfont */
+static void draw_batt_pct(uint8_t pct,uint16_t fg){
+    uint8_t ch[4]; uint8_t nc=0;
+    if(pct>=100){ch[nc++]=1;ch[nc++]=0;ch[nc++]=0;}
+    else if(pct>=10){ch[nc++]=pct/10;ch[nc++]=pct%10;}
+    else ch[nc++]=pct;
+    ch[nc++]=10;
+    win(PCT_X,PCT_Y,PCT_X+PCT_W-1,PCT_Y+SF_H-1); CS_LO; DC_HI;
+    for(uint8_t row=0;row<SF_H;row++){
+        uint8_t cp=0;
+        for(uint8_t ci=0;ci<nc;ci++){
+            uint16_t base=(uint16_t)ch[ci]*SF_BPD;
+            for(uint8_t col=0;col<SF_W;col++){
+                uint16_t bi=base+(uint16_t)row*SF_BPR+(col>>3);
+                uint8_t  bv=pgm_read_byte(&smfont[bi]);
+                uint16_t c=(bv&(0x80>>(col&7)))?fg:WHITE;
+                spi_tx(c>>8);spi_tx(c); cp++;
+            }
+            if(ci<nc-1){spi_tx(WHITE>>8);spi_tx(WHITE);spi_tx(WHITE>>8);spi_tx(WHITE);cp+=2;}
+        }
+        while(cp<PCT_W){spi_tx(WHITE>>8);spi_tx(WHITE);cp++;}
+    }
+    CS_HI;
+}
+
+/* Digit area panel — a clean outlined card */
+static void draw_box(void){
+    /* outer border */
+    hline(BOX_X,   BOX_Y,          BOX_W,I_RULE);
+    hline(BOX_X,   BOX_Y+BOX_H-1,  BOX_W,I_RULE);
+    fill(BOX_X,    BOX_Y,          1,BOX_H,I_RULE);
+    fill(BOX_X+BOX_W-1,BOX_Y,     1,BOX_H,I_RULE);
+    /* label inside top-left of box */
+    dtext(BOX_X+6,BOX_Y+5,"COUNT",I_MID,WHITE,1);
+    /* unit label bottom-right */
+    dtext(BOX_X+BOX_W-36,BOX_Y+BOX_H-12,"AUTO",I_MID,WHITE,1);
+}
+
+/* Draw the complete instrument UI */
+static void draw_instrument_ui(void){
+    fill(0,0,SCR_W,SCR_H,WHITE);
+    /* top bar */
+    draw_inst_topbar();
+    /* horizontal rules */
+    hline(0,SEP_Y,SCR_W,I_RULE);           /* below topbar area  */
+    hline(0,SCR_H-TB_H,SCR_W,I_RULE);      /* bottom hint bar    */
+    fill(0,SCR_H-TB_H,SCR_W,TB_H,I_TOPFILL);
+    dtext(8,SCR_H-TB_H+6,"K8: Diagnostic Mode",I_MID,I_TOPFILL,1);
+    /* battery */
+    draw_battery_border();
+    draw_battery(inst_batt);
+    /* digit box */
+    draw_box();
+    /* force all digits to redraw */
+    p0=0xFF; p1=0xFF; p2=0xFF; p3=0xFF; pc=0xFF;
+}
+
+/* Splash: draw static EDISON II, fade out, draw UI, fade in */
+static void run_splash(void){
+    /* Draw splash while dark */
+    win(0,0,SCR_W-1,SCR_H-1); CS_LO; DC_HI;
+    for(uint16_t row=0;row<SCR_H;row++){
+        uint16_t rb=row*SP_BPR;
+        for(uint8_t b2=0;b2<SP_BPR;b2++)
+            sp_row[b2]=pgm_read_byte(&sp_bmp[rb+b2]);
+        for(uint8_t b2=0;b2<SP_BPR;b2++){
+            uint8_t v=sp_row[b2];
+            spi_tx((v&0x80)?0x00:0xFF);spi_tx((v&0x80)?0x00:0xFF);
+            spi_tx((v&0x40)?0x00:0xFF);spi_tx((v&0x40)?0x00:0xFF);
+            spi_tx((v&0x20)?0x00:0xFF);spi_tx((v&0x20)?0x00:0xFF);
+            spi_tx((v&0x10)?0x00:0xFF);spi_tx((v&0x10)?0x00:0xFF);
+            spi_tx((v&0x08)?0x00:0xFF);spi_tx((v&0x08)?0x00:0xFF);
+            spi_tx((v&0x04)?0x00:0xFF);spi_tx((v&0x04)?0x00:0xFF);
+            spi_tx((v&0x02)?0x00:0xFF);spi_tx((v&0x02)?0x00:0xFF);
+            spi_tx((v&0x01)?0x00:0xFF);spi_tx((v&0x01)?0x00:0xFF);
+        }
+    }
+    CS_HI;
+
+    /* Hold 2 seconds */
+    for(uint8_t i=0;i<20;i++) _delay_ms(100);
+
+    /* Enable brightness control, fade out splash */
+    lcd_cmd(0x53);lcd_dat(0x2C);
+    lcd_cmd(0x51);lcd_dat(0xFF);
+    for(int16_t b=255;b>=0;b-=8){lcd_cmd(0x51);lcd_dat((uint8_t)b);delay_ms(18);}
+    lcd_cmd(0x51);lcd_dat(0x00);
+
+    /* Draw instrument UI while dark */
+    draw_instrument_ui();
+
+    /* Fade in */
+    for(uint16_t b=0;b<=255;b+=8){lcd_cmd(0x51);lcd_dat((uint8_t)b);delay_ms(18);}
+    lcd_cmd(0x51);lcd_dat(0xFF);
+
+    /* Disable brightness control — restores normal colour pipeline */
+    lcd_cmd(0x53);lcd_dat(0x00);
+}
+
+/* ================================================================
+   ██  DIAGNOSTIC UI  ██
+   ================================================================ */
+
+/* ── Chrome ────────────────────────────────────────── */
+static void topbar(const char *title){
+    fill(0,0,SCR_W,TB_H,C_TBFILL);
+    hline(0,TB_H-1,SCR_W,C_BLUE);
+    dtext(16,6,title,C_DARK,C_TBFILL,1);
+    uint32_t s=uptime/33;
+    numw(248,6,(uint16_t)(s/3600),2,C_MID,C_TBFILL,1);
+    glyph(260,6,':',C_MID,C_TBFILL,1);
+    numw(266,6,(uint16_t)((s/60)%60),2,C_MID,C_TBFILL,1);
+    glyph(278,6,':',C_MID,C_TBFILL,1);
+    numw(284,6,(uint16_t)(s%60),2,C_MID,C_TBFILL,1);
+}
+static void uptime_tick(void){
+    uint32_t s=uptime/33;
+    numw(248,6,(uint16_t)(s/3600),2,C_MID,C_TBFILL,1);
+    glyph(260,6,':',C_MID,C_TBFILL,1);
+    numw(266,6,(uint16_t)((s/60)%60),2,C_MID,C_TBFILL,1);
+    glyph(278,6,':',C_MID,C_TBFILL,1);
+    numw(284,6,(uint16_t)(s%60),2,C_MID,C_TBFILL,1);
+}
+static void hintbar(const char *msg){
+    fill(0,HB_Y,SCR_W,HB_H,C_TBFILL);
+    hline(0,HB_Y,SCR_W,C_RULE);
+    dtext(16,HB_Y+6,msg,C_DARK,C_TBFILL,1);
+}
+
+/* ── Diagnostic Splash ─────────────────────────────── */
+static void diag_splash(void){
+    fill(0,0,SCR_W,SCR_H,C_WHITE);
+    fill(0,0,SCR_W,4,C_BLUE);
+    fill(0,SCR_H-4,SCR_W,4,C_BLUE);
+    fill(0,0,4,SCR_H,C_BLUE);
+    fill(SCR_W-4,0,4,SCR_H,C_BLUE);
+    dtext(92,36,"MODSONIC INSTRUMENTS",C_MID,C_WHITE,1);
+    fill(32,50,256,2,C_RULE);
+    dtext(44,60,"EDISON-II",C_DARK,C_WHITE,3);
+    fill(32,92,256,2,C_RULE);
+    dtext(60,100,"Diagnostic Panel  v2.0",C_DARK,C_WHITE,1);
+    dtext(116,114,"Firmware  v2.0",C_MID,C_WHITE,1);
+    fill(60,148,200,26,C_LIGHT);
+    fill(60,148,200,1,C_RULE); fill(60,173,200,1,C_RULE);
+    fill(60,148,1,26,C_RULE);  fill(259,148,1,26,C_RULE);
+    dtext(76,155,"Press KEY-5 for Menu",C_BLUE,C_LIGHT,1);
+    fill(32,SCR_H-32,256,1,C_RULE);
+    dtext(44,SCR_H-26,"AVR128DA48  |  ST7789VI  |  TTP229",C_MID,C_WHITE,1);
+}
+
+/* ── Menu ──────────────────────────────────────────── */
+static const char *MLABEL[5]={
+    "Brightness Control",
+    "Button Test",
+    "Volume Control",
+    "System Info",
+    "Exit to Instrument"
+};
+static const char *MSUB[5]={
+    "Adjust display brightness  (K1/K2)",
+    "Test all 8 keypad inputs",
+    "Adjust simulated volume    (K3/K4)",
+    "Device and runtime info",
+    "Return to main instrument display"
+};
+static const uint8_t MPAGE[5]={
+    SCR_BRIGHT,SCR_BTNTEST,SCR_VOLUME,SCR_ABOUT,0xFF /* 0xFF = exit */
+};
+
+static void draw_menu_row(uint8_t i){
+    uint16_t ry=CA_Y+(uint16_t)i*40;
+    uint8_t  sel=(i==menu_cur);
+    uint16_t bg=sel?C_LIGHT:C_WHITE;
+    fill(0,ry,SCR_W,40,bg);
+    hline(0,ry+39,SCR_W,C_RULE);
+    fill(0,ry,4,40,sel?C_BLUE:C_RULE);
+    dtext(14,ry+8, MLABEL[i],sel?C_DARK:C_DARK,bg,1);
+    dtext(14,ry+22,MSUB[i],  C_MID,bg,1);
+    if(sel) fill(SCR_W-10,ry+16,6,8,C_BLUE);
+}
+static void show_menu(void){
+    topbar("Diagnostic Menu");
+    fill(0,CA_Y,SCR_W,CA_H,C_WHITE);
+    for(uint8_t i=0;i<5;i++) draw_menu_row(i);
+    hintbar("K1 Up   K2 Down   K5 Select   K6 Back");
+}
+static void menu_move(uint8_t old){
+    draw_menu_row(old);
+    draw_menu_row(menu_cur);
+}
+
+/* ── Brightness ────────────────────────────────────── */
+#define BR_BX  16
+#define BR_BY  (CA_Y+74)
+#define BR_BW  288
+#define BR_BH  20
+
+static void draw_bright_ui(void){
+    fill(BR_BX,BR_BY,BR_BW,BR_BH,C_TBFILL);
+    hline(BR_BX,BR_BY,BR_BW,C_MID);
+    hline(BR_BX,BR_BY+BR_BH-1,BR_BW,C_MID);
+    fill(BR_BX,BR_BY,1,BR_BH,C_MID);
+    fill(BR_BX+BR_BW-1,BR_BY,1,BR_BH,C_MID);
+    uint16_t fw=(uint16_t)bright_val*(BR_BW-2)/15;
+    fill(BR_BX+1,BR_BY+1,BR_BW-2,BR_BH-2,C_TBFILL);
+    if(fw) fill(BR_BX+1,BR_BY+1,fw,BR_BH-2,C_BLUE);
+    for(uint8_t t=0;t<=15;t++){
+        uint16_t tx=BR_BX+(uint16_t)t*(BR_BW/15);
+        fill(tx,BR_BY+BR_BH+1,1,4,C_RULE);
+    }
+    fill(126,BR_BY+32,78,22,C_WHITE);
+    numw(136,BR_BY+32,bright_val,2,C_DARK,C_WHITE,3);
+    dtext(184,BR_BY+40,"/15",C_MID,C_WHITE,1);
+}
+static void show_bright(void){
+    topbar("Brightness Control");
+    fill(0,CA_Y,SCR_W,CA_H,C_WHITE);
+    dtext(16,CA_Y+16,"Display Brightness",C_DARK,C_WHITE,2);
+    hline(16,CA_Y+38,288,C_RULE);
+    dtext(16,CA_Y+46,"Adjust the backlight level using K1 and K2.",C_MID,C_WHITE,1);
+    dtext(16,BR_BY+BR_BH+6,"Low",C_MID,C_WHITE,1);
+    dtext(274,BR_BY+BR_BH+6,"High",C_MID,C_WHITE,1);
+    draw_bright_ui();
+    hintbar("K1 Increase   K2 Decrease   K6 Back");
+}
+
+/* ── Button Test ───────────────────────────────────── */
+static const char *BTN_NAME[8]={"UP","DN","LT","RT","SEL","BCK","DIM","BRT"};
+static void draw_btn_tile(uint8_t k,uint8_t pressed){
+    uint16_t tx=4+(uint16_t)(k%4)*79;
+    uint16_t ty=CA_Y+4+(uint16_t)(k/4)*96;
+    uint16_t tw=73,th=90;
+    if(pressed){
+        fill(tx,ty,tw,th,C_BLUE);
+        fill(tx,ty,tw,14,C_DARK);
+        glyph(tx+tw-10,ty+4,'1'+k,C_WHITE,C_DARK,1);
+        dtext(tx+4,ty+4,"KEY",C_RULE,C_DARK,1);
+        dtext(tx+4,ty+22,BTN_NAME[k],C_WHITE,C_BLUE,2);
+        hline(tx+4,ty+54,tw-8,C_WHITE);
+        dtext(tx+4,ty+58,"CNT",C_WHITE,C_BLUE,1);
+        numw(tx+28,ty+58,key_cnt[k],4,C_WHITE,C_BLUE,1);
+        if(key_hold[k]>12){
+            fill(tx+4,ty+70,tw-8,16,C_WHITE);
+            dtext(tx+20,ty+74,"HOLD",C_BLUE,C_WHITE,1);
+        }
+    } else {
+        fill(tx,ty,tw,th,C_WHITE);
+        hline(tx,ty,tw,C_MID); hline(tx,ty+th-1,tw,C_MID);
+        fill(tx,ty,1,th,C_MID); fill(tx+tw-1,ty,1,th,C_MID);
+        fill(tx+1,ty+1,tw-2,13,C_TBFILL);
+        hline(tx+1,ty+14,tw-2,C_MID);
+        dtext(tx+4,ty+4,"KEY",C_MID,C_TBFILL,1);
+        glyph(tx+tw-10,ty+4,'1'+k,C_DARK,C_TBFILL,1);
+        dtext(tx+4,ty+22,BTN_NAME[k],C_DARK,C_WHITE,2);
+        hline(tx+4,ty+54,tw-8,C_RULE);
+        dtext(tx+4,ty+58,"CNT",C_MID,C_WHITE,1);
+        numw(tx+28,ty+58,key_cnt[k],4,C_MID,C_WHITE,1);
+    }
+}
+static void show_btntest(void){
+    topbar("Button Test");
+    fill(0,CA_Y,SCR_W,CA_H,C_WHITE);
+    prev_disp=0;
+    for(uint8_t k=0;k<8;k++) draw_btn_tile(k,0);
+    hintbar("Press any key to test   K6 Back");
+}
+static void btntest_update(uint8_t keys){
+    uint8_t changed=keys^prev_disp;
+    for(uint8_t k=0;k<8;k++)
+        if(changed&(1<<k)) draw_btn_tile(k,(keys>>k)&1);
+    prev_disp=keys;
+}
+
+/* ── Volume ────────────────────────────────────────── */
+#define VL_BX  16
+#define VL_BY  (CA_Y+74)
+#define VL_BW  288
+#define VL_BH  20
+static void draw_vol_ui(void){
+    fill(VL_BX,VL_BY,VL_BW,VL_BH,C_TBFILL);
+    hline(VL_BX,VL_BY,VL_BW,C_MID);
+    hline(VL_BX,VL_BY+VL_BH-1,VL_BW,C_MID);
+    fill(VL_BX,VL_BY,1,VL_BH,C_MID);
+    fill(VL_BX+VL_BW-1,VL_BY,1,VL_BH,C_MID);
+    uint16_t fw=(uint16_t)vol_val*(VL_BW-2)/100;
+    fill(VL_BX+1,VL_BY+1,VL_BW-2,VL_BH-2,C_TBFILL);
+    if(fw) fill(VL_BX+1,VL_BY+1,fw,VL_BH-2,C_BLUE);
+    for(uint8_t t=0;t<=10;t++){
+        uint16_t tx=VL_BX+(uint16_t)t*(VL_BW/10);
+        fill(tx,VL_BY+VL_BH+1,1,4,C_RULE);
+    }
+    fill(120,VL_BY+32,96,22,C_WHITE);
+    numw(132,VL_BY+32,vol_val,3,C_DARK,C_WHITE,3);
+    dtext(198,VL_BY+40,"%",C_MID,C_WHITE,1);
+}
+static void show_volume(void){
+    topbar("Volume Control");
+    fill(0,CA_Y,SCR_W,CA_H,C_WHITE);
+    dtext(16,CA_Y+16,"Volume Level",C_DARK,C_WHITE,2);
+    hline(16,CA_Y+38,288,C_RULE);
+    dtext(16,CA_Y+46,"Adjust the volume level using K3 and K4.",C_MID,C_WHITE,1);
+    dtext(16,VL_BY+VL_BH+6,"0%",C_MID,C_WHITE,1);
+    dtext(278,VL_BY+VL_BH+6,"100%",C_MID,C_WHITE,1);
+    draw_vol_ui();
+    hintbar("K3 Decrease   K4 Increase   K6 Back");
+}
+
+/* ── About ─────────────────────────────────────────── */
+static void show_about(void){
+    topbar("System Info");
+    fill(0,CA_Y,SCR_W,CA_H,C_WHITE);
+    fill(0,CA_Y+8,SCR_W,16,C_TBFILL);
+    hline(0,CA_Y+8,SCR_W,C_RULE); hline(0,CA_Y+24,SCR_W,C_RULE);
+    dtext(16,CA_Y+12,"DEVICE",C_DARK,C_TBFILL,1);
+    static const char *DK[6]={"MCU","Clock","Display","Keypad","Resolution","Firmware"};
+    static const char *DV[6]={"AVR128DA48","24 MHz","ST7789VI","TTP229","320 x 240","v2.0.0"};
+    for(uint8_t i=0;i<6;i++){
+        uint16_t dy=CA_Y+28+(uint16_t)i*16;
+        uint16_t rb=i%2?C_WHITE:(uint16_t)0xF7BE;
+        fill(0,dy,SCR_W,16,rb);
+        dtext(16,dy+4,DK[i],C_MID,rb,1);
+        fill(110,dy,1,16,C_RULE);
+        dtext(118,dy+4,DV[i],C_DARK,rb,1);
+        hline(0,dy+15,SCR_W,C_RULE);
+    }
+    fill(0,CA_Y+124,SCR_W,16,C_TBFILL);
+    hline(0,CA_Y+124,SCR_W,C_RULE); hline(0,CA_Y+140,SCR_W,C_RULE);
+    dtext(16,CA_Y+128,"RUNTIME",C_DARK,C_TBFILL,1);
+    uint16_t total=0;
+    for(uint8_t k=0;k<8;k++) total+=key_cnt[k];
+    uint32_t s=uptime/33;
+    static const char *SK[4]={"Uptime (s)","Key Presses","Volume","Brightness"};
+    uint16_t SV[4];
+    SV[0]=(uint16_t)(s%60000);SV[1]=total;SV[2]=vol_val;SV[3]=bright_val;
+    for(uint8_t i=0;i<4;i++){
+        uint16_t dy=CA_Y+144+(uint16_t)i*16;
+        uint16_t rb=i%2?C_WHITE:(uint16_t)0xF7BE;
+        fill(0,dy,SCR_W,16,rb);
+        dtext(16,dy+4,SK[i],C_MID,rb,1);
+        fill(110,dy,1,16,C_RULE);
+        numw(118,dy+4,SV[i],5,C_DARK,rb,1);
+        hline(0,dy+15,SCR_W,C_RULE);
+    }
+    hintbar("K6 Back");
+}
+
+/* ── Diag page router ──────────────────────────────── */
+static void diag_go(uint8_t p){
+    if(diag_page==SCR_BRIGHT && p!=SCR_BRIGHT){
+        lcd_cmd(0x53);lcd_dat(0x00);
+    }
+    diag_page=p;
+    switch(p){
+        case SCR_DMENU:  show_menu();   break;
+        case SCR_BRIGHT: apply_bright(bright_val); show_bright(); break;
+        case SCR_BTNTEST:show_btntest();break;
+        case SCR_VOLUME: show_volume(); break;
+        case SCR_ABOUT:  show_about();  break;
+        default:         show_menu();   break;
+    }
+}
+
+/* ================================================================
+   HARDWARE INIT
+   ================================================================ */
+static void clk24(void){
+    CPU_CCP=CCP_IOREG_gc;
+    CLKCTRL.OSCHFCTRLA=CLKCTRL_FRQSEL_24M_gc;
+}
+static void hw_init(void){
+    PORTD.DIRSET=PIN0_bm|PIN1_bm|PIN2_bm;
+    PORTD.OUTSET=PIN0_bm|PIN1_bm|PIN2_bm;
+    PORTA.DIRSET=PIN4_bm|PIN6_bm|PIN7_bm;
+    PORTA.DIRCLR=PIN5_bm;
+    PORTC.DIRCLR=PIN0_bm;
+    PORTC.PIN0CTRL=PORT_PULLUPEN_bm;
+    PORTB.DIRSET=PIN1_bm; PORTB.OUTSET=PIN1_bm;
+    PORTB.DIRCLR=PIN0_bm; PORTB.PIN0CTRL=PORT_PULLUPEN_bm;
+    SPI0.CTRLB=SPI_SSD_bm;
+    SPI0.CTRLA=SPI_MASTER_bm|SPI_ENABLE_bm|
+               SPI_CLK2X_bm|SPI_PRESC_DIV4_gc;
+}
+
+/* ================================================================
+   MAIN
+   ================================================================ */
+int main(void){
+    clk24();       /* clock MUST be set before everything else */
+    hw_init();
+    lcd_init();
+
+    /* Splash → instrument UI */
+    run_splash();
+
+    /* Instrument mode init */
+    inst_count=0; inst_batt=100;
+    uint8_t bt=0;
+    prev_keys=ttp_read();
+
+    while(1){
+        uptime++;
+        uint8_t keys=ttp_read();
+        uint8_t np  =keys&~prev_keys;
+        prev_keys=keys;
+
+        /* Hold + press tracking (shared) */
+        for(uint8_t k=0;k<8;k++){
+            if(keys&(1<<k)){if(key_hold[k]<255)key_hold[k]++;}
+            else key_hold[k]=0;
+            if(np&(1<<k)) key_cnt[k]++;
+        }
+
+        /* ── K8 ANYWHERE: toggle between instrument and diagnostic ── */
+        if(np&0x80){
+            if(mode==0){
+                /* Instrument → Diagnostic */
+                mode=1;
+                diag_splash();
+                uint8_t pk2=0;
+                while(1){
+                    uint8_t k2=ttp_read();
+                    if((k2&0x10)&&!(pk2&0x10)) break;
+                    pk2=k2; _delay_ms(50);
+                }
+                diag_go(SCR_DMENU);
+                prev_keys=ttp_read();
+            } else {
+                /* Diagnostic → Instrument (from anywhere, any page) */
+                if(diag_page==SCR_BRIGHT){lcd_cmd(0x53);lcd_dat(0x00);}
+                mode=0;
+                draw_instrument_ui();
+                p0=p1=p2=p3=pc=0xFF;
+                bt=0; prev_keys=ttp_read();
+            }
+            continue;
+        }
+
+        /* ── INSTRUMENT MODE ──────────────────────── */
+        if(mode==0){
+            /* Auto-count: advances every 500ms = every 10 x 50ms ticks */
+            static uint8_t count_tick=0;
+            if(++count_tick>=10){
+                count_tick=0;
+                inst_count++;
+                if(inst_count>9999) inst_count=0;
+            }
+
+            /* Battery: degrades every 500ms = every 10 x 50ms ticks */
+            if(++bt>=10){
+                bt=0;
+                if(inst_batt>0) inst_batt--; else inst_batt=100;
+                draw_battery(inst_batt);
+            }
+
+            /* Draw only changed digits */
+            uint8_t d0=(inst_count/1000)%10,d1=(inst_count/100)%10;
+            uint8_t d2=(inst_count/10)%10,  d3= inst_count%10;
+            uint8_t sc=(inst_count>=100)?1:0;
+            if(d0!=p0){draw_digit(D0_X,DIG_Y,d0,BLACK,WHITE);p0=d0;}
+            if(d1!=p1){draw_digit(D1_X,DIG_Y,d1,BLACK,WHITE);p1=d1;}
+            if(d2!=p2){draw_digit(D2_X,DIG_Y,d2,BLACK,WHITE);p2=d2;}
+            if(d3!=p3){draw_digit(D3_X,DIG_Y,d3,BLACK,WHITE);p3=d3;}
+            if(sc!=pc){draw_colon(sc?I_DARK:WHITE);pc=sc;}
+
+            _delay_ms(50);   /* short poll — K8 responds within 50ms */
+        }
+
+        /* ── DIAGNOSTIC MODE ─────────────────────── */
+        else {
+            /* K6: back one level, or back to instrument from menu */
+            if(np&0x20){
+                if(diag_page==SCR_DMENU){
+                    if(diag_page==SCR_BRIGHT){lcd_cmd(0x53);lcd_dat(0x00);}
+                    mode=0;
+                    draw_instrument_ui();
+                    p0=p1=p2=p3=pc=0xFF;
+                    bt=0; prev_keys=ttp_read();
+                } else {
+                    diag_go(SCR_DMENU);
+                }
+                _delay_ms(20); continue;
+            }
+
+            switch(diag_page){
+                case SCR_DMENU: {
+                    uint8_t oc=menu_cur;
+                    if(np&0x01){if(menu_cur>0)menu_cur--;}
+                    if(np&0x02){if(menu_cur<4)menu_cur++;}
+                    if(np&(0x01|0x02)) menu_move(oc);
+                    if(np&0x10){
+                        if(MPAGE[menu_cur]==0xFF){
+                            /* "Exit to Instrument" menu item */
+                            if(diag_page==SCR_BRIGHT){lcd_cmd(0x53);lcd_dat(0x00);}
+                            mode=0;
+                            draw_instrument_ui();
+                            p0=p1=p2=p3=pc=0xFF;
+                            bt=0; prev_keys=ttp_read();
+                            continue;
+                        }
+                        diag_go(MPAGE[menu_cur]);
+                    }
+                    break;
+                }
+                case SCR_BRIGHT: {
+                    static uint8_t bth=0; bth++;
+                    uint8_t ch=0;
+                    if((np&0x01)||(bth%5==0&&(keys&0x01))){if(bright_val<15){bright_val++;ch=1;}}
+                    if((np&0x02)||(bth%5==0&&(keys&0x02))){if(bright_val>0) {bright_val--;ch=1;}}
+                    if(ch){apply_bright(bright_val);draw_bright_ui();}
+                    break;
+                }
+                case SCR_BTNTEST:
+                    btntest_update(keys);
+                    break;
+                case SCR_VOLUME: {
+                    uint8_t ch=0;
+                    if(keys&0x08){if(vol_val<100){vol_val++;ch=1;}}
+                    if(keys&0x04){if(vol_val>0)  {vol_val--;ch=1;}}
+                    if(ch) draw_vol_ui();
+                    break;
+                }
+                case SCR_ABOUT:
+                    break;
+            }
+
+            if(uptime%33==0) uptime_tick();
+            _delay_ms(30);
+        }
+    }
+}

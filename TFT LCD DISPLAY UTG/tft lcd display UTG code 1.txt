@@ -1,0 +1,1473 @@
+#define F_CPU 24000000UL
+
+/* ================================================================
+   MODSONIC EDISON-II  —  INTEGRATED FIRMWARE  v3.0
+   AVR128DA48 @ 24MHz
+
+   HARDWARE (new PCB):
+     TFT : ST7789VI 320x240  via SPI
+           PD0=DC  PD1=RST  PD2=CS  PA4=MOSI  PA6=SCK
+     KEYS: TTP229 8-key capacitive
+           PB1=SCL  PB0=SDO
+     POWER: PA0=power button (ISR, falling edge)
+            PA5=power latch (HIGH=on)
+            PA6=low battery detect  ← NOTE: PA6 also used as SCK
+                (L_BATT sampled BEFORE SPI enabled; see hw_init note)
+     ULTRASONIC COUNTER BUS (new PCB routing — see NOTE below):
+           PB2=Q1  PB3=Q2  PB4=Q3  PB5=Q4  PC4=Q5  PC5=Q6
+           PC6=Q7  PC7=Q8(CLK10) — actual counter on PA1-PA3,PE0-PE2
+           *** PCB MUST route counter lines to non-conflicting pins ***
+           *** Kept as #defines — adjust to match your new PCB     ***
+     MCLOCK: PD3   COU_R: PD4   ECHO: PF0   CLK_10: PD5
+
+   KEY MAPPING (TTP229 → functions):
+     K1=UP (velocity/cal up)    K2=DOWN (velocity/cal down)
+     K3=MM/INCH toggle          K4=reserved
+     K5=PROBE (zero cal)        K6=CAL (thickness cal)
+     K7=reserved                K8=DIAGNOSTIC MODE toggle
+
+   FLOW:
+     Power on → INIT/INIT_M → TFT splash → THNESS loop
+     K8 → Diagnostic HMI (brightness/button test/volume/info)
+     K8 again → back to measurement
+
+   NOTE ON COUNTER BUS PINS:
+     Original: Q1-Q6=PB0-5, Q7-Q9=PD0-2, Q10-Q12=PC4-6
+     New PCB:  PB0/PB1 used by TTP229, PD0-2 used by TFT.
+     Counter lines REMAPPED to: Q1-Q6=PB2-5+PC4-5, Q7-Q9=PA1-3,
+     Q10-Q12=PC6-7+PF1. Adjust READ_CNT() if your PCB differs.
+   ================================================================ */
+
+#include <avr/cpufunc.h>
+#include <avr/eeprom.h>
+#include <avr/interrupt.h>
+#include <avr/io.h>
+#include <avr/pgmspace.h>
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+#include <stdint.h>
+#include <string.h>
+#include <util/delay.h>
+
+#include "logo_data.h"
+#include "font_data.h"
+#include "smallfont_data.h"
+#include "splash_data.h"
+
+#ifndef RSTCTRL_SWRE_bm
+#define RSTCTRL_SWRE_bm 0x01
+#endif
+
+/* ================================================================
+   PIN DEFINITIONS — NEW PCB
+   ================================================================ */
+/* TFT SPI */
+#define DC_LO      (PORTD.OUTCLR = PIN0_bm)
+#define DC_HI      (PORTD.OUTSET = PIN0_bm)
+#define RST_LO     (PORTD.OUTCLR = PIN1_bm)
+#define RST_HI     (PORTD.OUTSET = PIN1_bm)
+#define CS_LO      (PORTD.OUTCLR = PIN2_bm)
+#define CS_HI      (PORTD.OUTSET = PIN2_bm)
+/* TTP229 */
+#define TTP_SCL_HI (PORTB.OUTSET = PIN1_bm)
+#define TTP_SCL_LO (PORTB.OUTCLR = PIN1_bm)
+#define TTP_SDO    (PORTB.IN & PIN0_bm)
+/* Power & battery */
+#define P_10_PIN   PIN5_bm
+#define P_10_1     (PORTA.OUTSET = P_10_PIN)
+#define P_10_0     (PORTA.OUTCLR = P_10_PIN)
+#define L_BATT_PIN PIN6_bm
+#define SW_P_PIN   PIN0_bm
+#define INT_PIN    SW_P_PIN
+#define READ_L_BATT (!(PORTA.IN & L_BATT_PIN))
+/* Ultrasonic (remapped — adjust to match new PCB routing) */
+#define MCLOCK_1   (PORTD.OUTSET = PIN3_bm)
+#define MCLOCK_0   (PORTD.OUTCLR = PIN3_bm)
+#define COU_R_1    (PORTD.OUTSET = PIN4_bm)
+#define COU_R_0    (PORTD.OUTCLR = PIN4_bm)
+#define CLK_10_1   (PORTD.OUTSET = PIN5_bm)
+#define CLK_10_0   (PORTD.OUTCLR = PIN5_bm)
+#define ECHO_1     (PORTF.OUTSET = PIN0_bm)
+#define ECHO_0     (PORTF.OUTCLR = PIN0_bm)
+#define READ_ECHO  (PORTF.IN & PIN0_bm)
+/* TTP key bit masks */
+#define K_UP    0x01
+#define K_DN    0x02
+#define K_MM    0x04   /* K3: MM/INCH toggle */
+#define K_RES   0x08   /* K4: reserved */
+#define K_PROBE 0x10   /* K5: zero calibration */
+#define K_CAL   0x20   /* K6: known-thickness calibration */
+#define K_RES2  0x40   /* K7: reserved */
+#define K_DIAG  0x80   /* K8: diagnostic mode */
+
+/* ================================================================
+   FORWARD DECLARATIONS — needed for call-before-definition cases
+   ================================================================ */
+void DISPLAY(void);
+void CYCLE(void);
+void DIR_CAL(void);
+void CMP_CAL(void);
+void SUBDELTA(void);
+void PROBE(void);
+void DIST_C(void);
+void VELO(void);
+void IN_MM(void);
+void THNESS(void);
+void LO_BATT(void);
+void INIT(void);
+void INIT_M(void);
+void VE_DNC(void);
+void VE_UPC(void);
+void VE_UP(void);
+void VE_DN(void);
+void VE_DISP(void);
+void DIS_T(void);
+void DIR_C(void);
+uint8_t CK_C(void);
+void CLEAR_LCD(void);
+void CLEAR_LCD_ISR(void);
+void DATA_LCD(void);
+void EEPROM_SaveCalibration(void);
+uint8_t EEPROM_ValidateCalibration(void);
+void EEPROM_LoadCalibration(void);
+uint8_t SUM_A(void);
+uint8_t SUM_CK(void);
+void SUM_S(void);
+void TIMER_OVERFLOW(void);
+void DELAY(uint16_t t);
+void DELAYL(uint16_t v);
+void DELAYS(void);
+void DELAYD(uint16_t v);
+void DLY_LOG(uint8_t d);
+uint32_t MUL32(uint32_t a, uint16_t b);
+uint16_t DIV32(uint32_t a, uint16_t b);
+uint8_t VNOTCH(uint16_t p);
+uint8_t VPATH_VLAUE(uint8_t i);
+uint16_t MM(uint16_t p);
+uint16_t INCH(uint16_t p);
+void READ_CNT(void);
+void INCREMENT(void);
+void DECREMENT(void);
+void F_INC(void);
+void F_DEC(void);
+
+/* ================================================================
+   TIMER CONSTANTS (24MHz, no prescaler)
+   ================================================================ */
+#define TIMER_VAL_SHORT 384
+#define TIMER_VAL_LONG  1920
+
+/* ================================================================
+   EEPROM VARIABLES
+   ================================================================ */
+uint16_t EEMEM ee_velo;
+uint32_t EEMEM ee_delta;
+uint16_t EEMEM ee_lcdlm;
+uint8_t  EEMEM ee_mmif;
+uint8_t  EEMEM ee_once8;
+uint8_t  EEMEM ee_checksum;
+uint8_t  EEMEM ee_checksum_c;
+
+/* ================================================================
+   .noinit RAM — survives warm reset
+   ================================================================ */
+volatile uint8_t  _POW_VAR    __attribute__((section(".noinit")));
+volatile uint8_t  _SUM_VAR    __attribute__((section(".noinit")));
+volatile uint8_t  _SUM_C_VAR  __attribute__((section(".noinit")));
+volatile uint16_t _VELO_VAR   __attribute__((section(".noinit")));
+volatile uint32_t _DELTA_VAR  __attribute__((section(".noinit")));
+volatile uint16_t _LCD_LM_VAR __attribute__((section(".noinit")));
+volatile uint8_t  _MM_IF_VAR  __attribute__((section(".noinit")));
+volatile uint8_t  _ONCE_8_VAR __attribute__((section(".noinit")));
+
+volatile uint8_t  *ucPOW     = &_POW_VAR;
+volatile uint8_t  *ucSUM     = &_SUM_VAR;
+volatile uint8_t  *ucSUM_C   = &_SUM_C_VAR;
+volatile uint16_t *uiVELO_12 = &_VELO_VAR;
+volatile uint32_t *ulDELTA   = &_DELTA_VAR;
+volatile uint16_t *uiLCD_LM  = &_LCD_LM_VAR;
+volatile uint8_t  *MM_IF     = &_MM_IF_VAR;
+volatile uint8_t  *once_8    = &_ONCE_8_VAR;
+
+/* ================================================================
+   GLOBAL MEASUREMENT VARIABLES
+   ================================================================ */
+volatile uint8_t  UP_DATE      = 0;
+volatile uint8_t  ECHO_F       = 0;
+volatile uint8_t  DP_1         = 0;
+volatile uint8_t  DP_2         = 0;
+volatile uint32_t ulReadCnt    = 0;
+volatile uint32_t ulCY         = 0;
+volatile uint16_t uiDeciaValue = 0;
+volatile uint8_t  TEMP         = 0;
+volatile uint8_t  ucBATT       = 0;
+volatile uint8_t  ucAUTO       = 0;
+volatile uint8_t  timerOverflow= 0;
+
+/* ================================================================
+   UI STATE (shared)
+   ================================================================ */
+/* Colours */
+#define WHITE    0xFFFF
+#define BLACK    0x0000
+#define C_DARK   0x2104
+#define C_MID    0x4208
+#define C_LIGHT  0xCEFF
+#define C_RULE   0xA534
+#define C_TBFILL 0xE71C
+#define C_BLUE   0x04BF
+#define C_RED    0xF800
+#define I_TOPFILL C_TBFILL
+#define I_RULE    C_RULE
+#define I_DARK    C_DARK
+#define I_MID     C_MID
+#define I_BLUE    C_BLUE
+#define I_BAT_OK  0x04BF
+#define I_BAT_LOW 0xF800
+
+/* Layout */
+#define SCR_W  320
+#define SCR_H  240
+#define TB_H    20
+#define HB_H    20
+#define CA_Y   TB_H
+#define CA_H   (SCR_H - TB_H - HB_H)
+#define HB_Y   (SCR_H - HB_H)
+#define DIG_Y   80
+#define D0_X    18
+#define D1_X    86
+#define D2_X   166
+#define D3_X   234
+#define COL_X  148
+#define COL_Y1 104
+#define COL_Y2 134
+#define COL_SZ  12
+#define BOX_X   10
+#define BOX_Y   66
+#define BOX_W  300
+#define BOX_H  118
+
+/* Diagnostic screens */
+#define SCR_DMENU   0
+#define SCR_BRIGHT  1
+#define SCR_BTNTEST 2
+#define SCR_VOLUME  3
+#define SCR_ABOUT   4
+
+/* UI mode */
+static uint8_t  mode       = 0;  /* 0=instrument 1=diagnostic */
+static uint8_t  prev_keys  = 0;
+static uint32_t uptime     = 0;
+static uint16_t key_cnt[8];
+static uint8_t  key_hold[8];
+static uint8_t  sp_row[SP_BPR];
+
+/* Instrument UI */
+static uint8_t  p0=0xFF,p1=0xFF,p2=0xFF,p3=0xFF,pc=0xFF;
+static uint8_t  disp_batt  = 100; /* displayed battery 0-100           */
+static uint8_t  meas_tick  = 0;   /* measurement rate counter          */
+static uint8_t  bat_tick   = 0;   /* battery display rate counter      */
+
+/* Diagnostic UI */
+static uint8_t  diag_page  = SCR_DMENU;
+static uint8_t  menu_cur   = 0;
+static uint8_t  bright_val = 10;
+static uint8_t  vol_val    = 60;
+static uint8_t  prev_disp  = 0;
+
+/* ================================================================
+   TIMER FUNCTIONS  (identical to old code)
+   ================================================================ */
+static inline void Timer_Start(uint16_t value){
+    TCB0.CNT=0; TCB0.CCMP=value;
+    TCB0.INTFLAGS=TCB_CAPT_bm; timerOverflow=0;
+    TCB0.CTRLA|=TCB_ENABLE_bm;
+}
+static inline void Timer_Stop(void){ TCB0.CTRLA&=~TCB_ENABLE_bm; }
+static inline uint8_t Timer_Overflow(void){
+    return (TCB0.INTFLAGS&TCB_CAPT_bm)?1:0;
+}
+static inline void Timer_Reload(uint16_t value){
+    TCB0.CNT=0; TCB0.CCMP=value; TCB0.INTFLAGS=TCB_CAPT_bm;
+}
+void TIMER_OVERFLOW(void){
+    TCB0.INTFLAGS=TCB_CAPT_bm;
+    TCB0.CTRLA&=~TCB_ENABLE_bm;
+    timerOverflow=0;
+}
+
+/* ================================================================
+   EEPROM  (identical to old code)
+   ================================================================ */
+void EEPROM_SaveCalibration(void){
+    uint8_t sum=0;
+    eeprom_update_word(&ee_velo,  *uiVELO_12);
+    eeprom_update_dword(&ee_delta,*ulDELTA);
+    eeprom_update_word(&ee_lcdlm, *uiLCD_LM);
+    eeprom_update_byte(&ee_mmif,  *MM_IF);
+    eeprom_update_byte(&ee_once8, *once_8);
+    sum+=(uint8_t)(*uiVELO_12&0xFF);
+    sum+=(uint8_t)(*uiVELO_12>>8);
+    sum+=(uint8_t)(*ulDELTA&0xFF);
+    sum+=(uint8_t)((*ulDELTA>>8)&0xFF);
+    sum+=(uint8_t)((*ulDELTA>>16)&0xFF);
+    sum+=(uint8_t)((*ulDELTA>>24)&0xFF);
+    sum+=(uint8_t)(*uiLCD_LM&0xFF);
+    sum+=(uint8_t)(*uiLCD_LM>>8);
+    sum+=*MM_IF; sum+=*once_8;
+    eeprom_update_byte(&ee_checksum,  sum);
+    eeprom_update_byte(&ee_checksum_c,sum-1);
+}
+uint8_t EEPROM_ValidateCalibration(void){
+    uint8_t sum=0;
+    uint16_t velo  =eeprom_read_word(&ee_velo);
+    uint32_t delta =eeprom_read_dword(&ee_delta);
+    uint16_t lcdlm =eeprom_read_word(&ee_lcdlm);
+    uint8_t  mmif  =eeprom_read_byte(&ee_mmif);
+    uint8_t  once8 =eeprom_read_byte(&ee_once8);
+    sum+=(uint8_t)(velo&0xFF); sum+=(uint8_t)(velo>>8);
+    sum+=(uint8_t)(delta&0xFF);sum+=(uint8_t)((delta>>8)&0xFF);
+    sum+=(uint8_t)((delta>>16)&0xFF);sum+=(uint8_t)((delta>>24)&0xFF);
+    sum+=(uint8_t)(lcdlm&0xFF);sum+=(uint8_t)(lcdlm>>8);
+    sum+=mmif; sum+=once8;
+    if(sum==eeprom_read_byte(&ee_checksum))
+        if((sum-1)==eeprom_read_byte(&ee_checksum_c))
+            return 0x00;
+    return 0xFF;
+}
+void EEPROM_LoadCalibration(void){
+    *uiVELO_12=eeprom_read_word(&ee_velo);
+    *ulDELTA  =eeprom_read_dword(&ee_delta);
+    *uiLCD_LM =eeprom_read_word(&ee_lcdlm);
+    *MM_IF    =eeprom_read_byte(&ee_mmif);
+    *once_8   =eeprom_read_byte(&ee_once8);
+}
+
+/* ================================================================
+   CHECKSUM  (identical to old code)
+   ================================================================ */
+uint8_t SUM_A(void){
+    uint8_t s=0;
+    s+=*((uint8_t*)uiVELO_12);  s+=*((uint8_t*)uiVELO_12+1);
+    s+=*((uint8_t*)ulDELTA);    s+=*((uint8_t*)ulDELTA+1);
+    s+=*((uint8_t*)ulDELTA+2);
+    s+=*((uint8_t*)uiLCD_LM);   s+=*((uint8_t*)uiLCD_LM+1);
+    return s;
+}
+uint8_t SUM_CK(void){
+    uint8_t t=SUM_A();
+    if(t==*ucSUM && (t-1)==*ucSUM_C) return 0x00;
+    if(EEPROM_ValidateCalibration()==0x00){EEPROM_LoadCalibration();return 0x00;}
+    return 0xFF;
+}
+void SUM_S(void){
+    EEPROM_SaveCalibration();
+    uint8_t t=SUM_A(); *ucSUM=t; *ucSUM_C=t-1;
+}
+
+/* ================================================================
+   SPI + TFT PRIMITIVES
+   ================================================================ */
+static void spi_tx(uint8_t d){
+    SPI0.DATA=d; while(!(SPI0.INTFLAGS&SPI_IF_bm));
+}
+static void lcd_cmd(uint8_t c){ CS_LO;DC_LO;spi_tx(c);CS_HI; }
+static void lcd_dat(uint8_t d){ CS_LO;DC_HI;spi_tx(d);CS_HI; }
+static void win(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1){
+    lcd_cmd(0x2A);lcd_dat(x0>>8);lcd_dat(x0);lcd_dat(x1>>8);lcd_dat(x1);
+    lcd_cmd(0x2B);lcd_dat(y0>>8);lcd_dat(y0);lcd_dat(y1>>8);lcd_dat(y1);
+    lcd_cmd(0x2C);
+}
+static void fill(uint16_t x,uint16_t y,uint16_t w,uint16_t h,uint16_t c){
+    if(!w||!h) return;
+    win(x,y,x+w-1,y+h-1); CS_LO; DC_HI;
+    for(uint32_t i=0;i<(uint32_t)w*h;i++){spi_tx(c>>8);spi_tx(c);}
+    CS_HI;
+}
+static void hline(uint16_t x,uint16_t y,uint16_t w,uint16_t c){fill(x,y,w,1,c);}
+
+static void lcd_init(void){
+    RST_HI;_delay_ms(50);RST_LO;_delay_ms(50);RST_HI;_delay_ms(200);
+    lcd_cmd(0x11);_delay_ms(120);
+    lcd_cmd(0x36);lcd_dat(0x60); lcd_cmd(0x3A);lcd_dat(0x55);
+    lcd_cmd(0xB2);lcd_dat(0x0C);lcd_dat(0x0C);lcd_dat(0x00);
+                  lcd_dat(0x33);lcd_dat(0x33);
+    lcd_cmd(0xB7);lcd_dat(0x35); lcd_cmd(0xBB);lcd_dat(0x19);
+    lcd_cmd(0xC0);lcd_dat(0x2C); lcd_cmd(0xC2);lcd_dat(0x01);
+    lcd_cmd(0xC3);lcd_dat(0x12); lcd_cmd(0xC4);lcd_dat(0x20);
+    lcd_cmd(0xC6);lcd_dat(0x0F); lcd_cmd(0xD0);lcd_dat(0xA4);lcd_dat(0xA1);
+    lcd_cmd(0xE0);
+    lcd_dat(0xD0);lcd_dat(0x04);lcd_dat(0x0D);lcd_dat(0x11);
+    lcd_dat(0x13);lcd_dat(0x2B);lcd_dat(0x3F);lcd_dat(0x54);
+    lcd_dat(0x4C);lcd_dat(0x18);lcd_dat(0x0D);lcd_dat(0x0B);
+    lcd_dat(0x1F);lcd_dat(0x23);
+    lcd_cmd(0xE1);
+    lcd_dat(0xD0);lcd_dat(0x04);lcd_dat(0x0C);lcd_dat(0x11);
+    lcd_dat(0x13);lcd_dat(0x2C);lcd_dat(0x3F);lcd_dat(0x44);
+    lcd_dat(0x51);lcd_dat(0x2F);lcd_dat(0x1F);lcd_dat(0x1F);
+    lcd_dat(0x20);lcd_dat(0x23);
+    lcd_cmd(0x21); lcd_cmd(0x35);lcd_dat(0x00);
+    lcd_cmd(0x29);_delay_ms(50);
+}
+static void apply_bright(uint8_t lv){
+    lcd_cmd(0x53);lcd_dat(0x2C);
+    lcd_cmd(0x51);lcd_dat((uint8_t)((uint16_t)lv*255/15));
+}
+/* TFT safe shutdown — fills black, used in power-off ISR */
+static void tft_clear_isr(void){
+    fill(0,0,SCR_W,SCR_H,BLACK);
+}
+
+/* ================================================================
+   DELAY HELPERS
+   ================================================================ */
+static void delay_ms(uint16_t ms){
+    while(ms>=100){_delay_ms(100);ms-=100;}
+    while(ms>=10) {_delay_ms(10); ms-=10; }
+    while(ms>=1)  {_delay_ms(1);  ms-=1;  }
+}
+void DELAY(uint16_t t){ volatile uint16_t i; for(i=0;i<t;i++) _delay_us(50); }
+void DELAYL(uint16_t v){ uint16_t i; for(i=0;i<v;i++) DELAY(0x15); }
+void DELAYS(void){
+    uint16_t i,j;
+    for(i=0;i<0x80;i++) for(j=0;j<0x80;j++) _delay_us(10);
+}
+void DELAYD(uint16_t v){ uint16_t i; for(i=0;i<v;i++) DELAY(0x15); }
+void DLY_LOG(uint8_t d){ uint16_t i; for(i=0;i<d;i++) DELAY(d); }
+
+/* ================================================================
+   TTP229 KEYPAD
+   ================================================================ */
+static uint8_t ttp_read(void){
+    uint8_t k=0;
+    for(uint8_t i=0;i<8;i++){
+        TTP_SCL_LO;_delay_us(3);
+        if(!TTP_SDO) k|=(1<<i);
+        TTP_SCL_HI;_delay_us(3);
+    }
+    for(uint8_t i=0;i<8;i++){TTP_SCL_LO;_delay_us(3);TTP_SCL_HI;_delay_us(3);}
+    return k;
+}
+
+/* ================================================================
+   FONT  5x7, scalable, ASCII 32-126
+   ================================================================ */
+static const uint8_t FONT[95][7] PROGMEM = {
+{0x00,0x00,0x00,0x00,0x00,0x00,0x00},{0x04,0x04,0x04,0x04,0x00,0x00,0x04},
+{0x0A,0x0A,0x00,0x00,0x00,0x00,0x00},{0x0A,0x1F,0x0A,0x0A,0x1F,0x0A,0x00},
+{0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04},{0x18,0x19,0x02,0x04,0x08,0x13,0x03},
+{0x0C,0x12,0x14,0x08,0x15,0x12,0x0D},{0x04,0x04,0x00,0x00,0x00,0x00,0x00},
+{0x02,0x04,0x08,0x08,0x08,0x04,0x02},{0x08,0x04,0x02,0x02,0x02,0x04,0x08},
+{0x00,0x04,0x15,0x0E,0x15,0x04,0x00},{0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
+{0x00,0x00,0x00,0x00,0x06,0x04,0x08},{0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
+{0x00,0x00,0x00,0x00,0x00,0x06,0x06},{0x01,0x01,0x02,0x04,0x08,0x10,0x10},
+{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+{0x0E,0x11,0x01,0x06,0x08,0x10,0x1F},{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
+{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},{0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},{0x0E,0x11,0x11,0x0F,0x01,0x11,0x0E},
+{0x00,0x06,0x06,0x00,0x06,0x06,0x00},{0x00,0x06,0x06,0x00,0x06,0x04,0x08},
+{0x01,0x02,0x04,0x08,0x04,0x02,0x01},{0x00,0x00,0x1F,0x00,0x1F,0x00,0x00},
+{0x10,0x08,0x04,0x02,0x04,0x08,0x10},{0x0E,0x11,0x01,0x06,0x04,0x00,0x04},
+{0x0E,0x11,0x01,0x0D,0x15,0x15,0x0E},{0x04,0x0A,0x11,0x11,0x1F,0x11,0x11},
+{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
+{0x1C,0x12,0x11,0x11,0x11,0x12,0x1C},{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
+{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},{0x0E,0x11,0x10,0x10,0x13,0x11,0x0E},
+{0x11,0x11,0x11,0x1F,0x11,0x11,0x11},{0x0E,0x04,0x04,0x04,0x04,0x04,0x0E},
+{0x07,0x02,0x02,0x02,0x02,0x12,0x0C},{0x11,0x12,0x14,0x18,0x14,0x12,0x11},
+{0x10,0x10,0x10,0x10,0x10,0x10,0x1F},{0x11,0x1B,0x15,0x11,0x11,0x11,0x11},
+{0x11,0x11,0x19,0x15,0x13,0x11,0x11},{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
+{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},{0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},
+{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},{0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E},
+{0x1F,0x04,0x04,0x04,0x04,0x04,0x04},{0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
+{0x11,0x11,0x11,0x11,0x11,0x0A,0x04},{0x11,0x11,0x11,0x15,0x15,0x1B,0x11},
+{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},{0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
+{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},{0x0E,0x08,0x08,0x08,0x08,0x08,0x0E},
+{0x10,0x10,0x08,0x04,0x02,0x01,0x01},{0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
+{0x04,0x0A,0x11,0x00,0x00,0x00,0x00},{0x00,0x00,0x00,0x00,0x00,0x00,0x1F},
+{0x08,0x04,0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F},
+{0x10,0x10,0x1C,0x12,0x11,0x11,0x1E},{0x00,0x00,0x0E,0x10,0x10,0x11,0x0E},
+{0x01,0x01,0x0F,0x11,0x11,0x11,0x0F},{0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E},
+{0x06,0x09,0x08,0x1C,0x08,0x08,0x08},{0x00,0x0F,0x11,0x11,0x0F,0x01,0x0E},
+{0x10,0x10,0x16,0x19,0x11,0x11,0x11},{0x04,0x00,0x0C,0x04,0x04,0x04,0x0E},
+{0x02,0x00,0x06,0x02,0x02,0x12,0x0C},{0x10,0x10,0x11,0x12,0x1C,0x12,0x11},
+{0x0C,0x04,0x04,0x04,0x04,0x04,0x0E},{0x00,0x00,0x1A,0x15,0x15,0x11,0x11},
+{0x00,0x00,0x16,0x19,0x11,0x11,0x11},{0x00,0x00,0x0E,0x11,0x11,0x11,0x0E},
+{0x00,0x1E,0x11,0x11,0x1E,0x10,0x10},{0x00,0x0F,0x11,0x11,0x0F,0x01,0x01},
+{0x00,0x00,0x16,0x19,0x10,0x10,0x10},{0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E},
+{0x08,0x08,0x1C,0x08,0x08,0x09,0x06},{0x00,0x00,0x11,0x11,0x11,0x13,0x0D},
+{0x00,0x00,0x11,0x11,0x11,0x0A,0x04},{0x00,0x00,0x11,0x11,0x15,0x15,0x0A},
+{0x00,0x00,0x11,0x0A,0x04,0x0A,0x11},{0x00,0x11,0x11,0x0F,0x01,0x11,0x0E},
+{0x00,0x00,0x1F,0x02,0x04,0x08,0x1F},{0x02,0x04,0x04,0x08,0x04,0x04,0x02},
+{0x04,0x04,0x04,0x00,0x04,0x04,0x04},{0x08,0x04,0x04,0x02,0x04,0x04,0x08},
+{0x00,0x08,0x15,0x02,0x00,0x00,0x00},
+};
+static void glyph(uint16_t x,uint16_t y,char c,uint16_t fg,uint16_t bg,uint8_t sc){
+    if(c<32||c>126){fill(x,y,5*sc,7*sc,bg);return;}
+    for(uint8_t r=0;r<7;r++){
+        uint8_t b=pgm_read_byte(&FONT[(uint8_t)(c-32)][r]);
+        for(uint8_t col=0;col<5;col++)
+            fill(x+col*sc,y+r*sc,sc,sc,(b&(0x10>>col))?fg:bg);
+    }
+}
+static void dtext(uint16_t x,uint16_t y,const char*s,uint16_t fg,uint16_t bg,uint8_t sc){
+    while(*s){glyph(x,y,*s,fg,bg,sc);x+=(uint16_t)(5+1)*sc;s++;}
+}
+static void numw(uint16_t x,uint16_t y,uint16_t n,uint8_t d,uint16_t fg,uint16_t bg,uint8_t sc){
+    char b[6]; uint8_t i=d; b[i]=0;
+    while(i--){b[i]=(char)('0'+n%10);n/=10;}
+    dtext(x,y,b,fg,bg,sc);
+}
+static void glyph_bold(uint16_t x,uint16_t y,char c,uint16_t fg,uint16_t bg,uint8_t sc){
+    if(c<32||c>126){fill(x,y,(5+1)*sc,7*sc,bg);return;}
+    fill(x,y,(5+1)*sc,7*sc,bg);
+    for(uint8_t r=0;r<7;r++){
+        uint8_t b=pgm_read_byte(&FONT[(uint8_t)(c-32)][r]);
+        for(uint8_t col=0;col<5;col++)
+            if(b&(0x10>>col)){
+                fill(x+col*sc,y+r*sc,sc,sc,fg);
+                fill(x+col*sc+1,y+r*sc,sc,sc,fg);
+            }
+    }
+}
+static void dtext_bold(uint16_t x,uint16_t y,const char*s,uint16_t fg,uint16_t bg,uint8_t sc){
+    while(*s){glyph_bold(x,y,*s,fg,bg,sc);x+=(uint16_t)(5+2)*sc;s++;}
+}
+static void numw_bold(uint16_t x,uint16_t y,uint16_t n,uint8_t d,uint16_t fg,uint16_t bg,uint8_t sc){
+    char b[6]; uint8_t i=d; b[i]=0;
+    while(i--){b[i]=(char)('0'+n%10);n/=10;}
+    dtext_bold(x,y,b,fg,bg,sc);
+}
+
+/* ================================================================
+   MEASUREMENT MATH  (identical to old code)
+   ================================================================ */
+uint32_t MUL32(uint32_t a,uint16_t b){ return a*b; }
+uint16_t DIV32(uint32_t a,uint16_t b){ return (uint16_t)(a/b); }
+
+uint8_t VPATH_VLAUE(uint8_t i){
+    if(i<=2)  return 0x38; if(i<=4)  return 0x37; if(i==5)  return 0x36;
+    if(i<=7)  return 0x35; if(i==8)  return 0x34; if(i<=10) return 0x33;
+    if(i==11) return 0x32; if(i<=13) return 0x31; if(i<=15) return 0x30;
+    if(i<=17) return 0x2F; if(i<=19) return 0x2E; if(i<=21) return 0x2D;
+    if(i<=23) return 0x2B; if(i==24) return 0x2A; if(i==25) return 0x29;
+    if(i<=27) return 0x28; if(i<=29) return 0x27; if(i<=31) return 0x26;
+    if(i<=33) return 0x25; if(i<=35) return 0x24; if(i<=37) return 0x23;
+    if(i<=39) return 0x22; if(i<=41) return 0x21; if(i<=43) return 0x20;
+    if(i<=45) return 0x1F; if(i<=48) return 0x1E; if(i<=51) return 0x1D;
+    if(i<=53) return 0x1C; if(i<=55) return 0x1B; if(i<=59) return 0x1A;
+    if(i<=62) return 0x19; if(i<=65) return 0x18; if(i<=69) return 0x17;
+    if(i<=72) return 0x16; if(i<=75) return 0x15; if(i<=80) return 0x14;
+    if(i<=85) return 0x13; if(i<=91) return 0x12; if(i<=95) return 0x11;
+    if(i<=101)return 0x10; if(i<=106)return 0x0F; if(i<=112)return 0x0E;
+    if(i<=119)return 0x0D; if(i<=126)return 0x0C; if(i<=133)return 0x0B;
+    if(i<=141)return 0x0A; if(i<=149)return 0x09; if(i<=158)return 0x08;
+    if(i<=167)return 0x07; if(i<=175)return 0x06; if(i<=184)return 0x05;
+    if(i<=193)return 0x04; if(i<=202)return 0x03; if(i<=212)return 0x02;
+    if(i<=223)return 0x01; return 0x00;
+}
+uint8_t VNOTCH(uint16_t p){
+    uint16_t d;
+    if(p>0x09C4) return 0;
+    if(p>0x03E8){d=DIV32(p,0x64);return 0x19-d;}
+    d=DIV32(p,0x0A);
+    return VPATH_VLAUE((uint8_t)d);
+}
+uint16_t MM(uint16_t p){ return DIV32(p,0x0A); }
+uint16_t INCH(uint16_t p){ return DIV32(MUL32(p,0x0A),0x00FE); }
+
+/* ================================================================
+   ULTRASONIC MEASUREMENT  (identical logic, remapped pins — see NOTE)
+   ================================================================ */
+void READ_CNT(void){
+    /* NOTE: On new PCB, counter lines must be routed away from
+       PD0-2 (TFT) and PB0-1 (TTP229).
+       ASSUMED new routing:
+         Q1-Q6:  PB2-5, PC4-5
+         Q7-Q9:  PA1-3  (old push button pins, now free)
+         Q10-Q12:PC6-7, PF1
+       Adjust these masks to match your actual PCB routing.       */
+    uint8_t pA=PORTA.IN, pB=PORTB.IN, pC=PORTC.IN;
+    uint16_t cv=0;
+    cv  = (pB>>2)&0x0F;                    /* PB2-5 = Q1-Q4, bits 0-3  */
+    cv |= (uint16_t)((pC>>4)&0x03)<<4;     /* PC4-5 = Q5-Q6, bits 4-5  */
+    cv |= (uint16_t)((pA>>1)&0x07)<<6;     /* PA1-3 = Q7-Q9, bits 6-8  */
+    cv |= (uint16_t)((pC>>6)&0x03)<<9;     /* PC6-7 = Q10-Q11, bits 9-10 */
+    cv |= (uint16_t)(PORTF.IN&PIN1_bm)<<10;/* PF1   = Q12, bit 11      */
+    ulReadCnt+=cv;
+}
+
+void CYCLE(void){
+    uint16_t i;
+    volatile uint8_t t=0;
+    ulReadCnt=0; ECHO_F=0x01;
+    for(i=0;i<100;i++){
+        COU_R_1; _delay_us(50);
+        COU_R_0; _delay_us(5);
+        MCLOCK_1; _delay_us(2);
+        MCLOCK_0;
+        _delay_us(200);
+        READ_CNT();
+        t=PORTB.IN;
+        if(PORTB.IN!=t){ECHO_F=0x00;DELAYS();return;}
+        _delay_us(700);
+    }
+    Timer_Reload(TIMER_VAL_LONG);
+}
+
+void SUBDELTA(void){ ulCY=ulReadCnt-*ulDELTA; }
+
+void DIR_CAL(void){
+    uint16_t uiTemp,uiDiv32;
+    uint32_t ulMul32;
+    UP_DATE=0x00;
+    ulMul32=MUL32(ulCY,*uiVELO_12);
+    uiDiv32=DIV32(ulMul32,0x9C40);
+    uiTemp=uiDiv32-VNOTCH(uiDiv32);
+    if(*MM_IF==0x00){*uiLCD_LM=MM(uiTemp);DP_2=0x00;DP_1=0x01;}
+    else             {*uiLCD_LM=INCH(uiTemp);DP_1=0x00;DP_2=0x01;}
+    if(*once_8==0)   *uiLCD_LM=*uiLCD_LM-0x0B33;
+    TEMP=(uint8_t)*uiLCD_LM;
+}
+
+void CMP_CAL(void){
+    uint32_t ulM; uint16_t uiD,uiT;
+    UP_DATE=0x00;
+    ulM=MUL32(ulCY,*uiVELO_12);
+    uiD=DIV32(ulM,0x9C40);
+    uiT=uiD-VNOTCH(uiD);
+    if(*MM_IF==0x00)*uiLCD_LM=MM(uiT);
+    else            *uiLCD_LM=INCH(uiT);
+}
+
+/* ================================================================
+   DISPLAY — show measurement on TFT
+   Called wherever old code called DISPLAY() / DATA_LCD()
+   ================================================================ */
+static void draw_digit_pgm(uint16_t x,uint16_t y,uint8_t d,uint16_t fg,uint16_t bg){
+    uint16_t base=(uint16_t)d*DIG_BPD;
+    win(x,y,x+DIG_W-1,y+DIG_H-1); CS_LO; DC_HI;
+    for(uint8_t row=0;row<DIG_H;row++)
+        for(uint8_t col=0;col<DIG_W;col++){
+            uint16_t bi=base+(uint16_t)row*DIG_BPR+(col>>3);
+            uint8_t  bv=pgm_read_byte(&dfont[bi]);
+            uint16_t c=(bv&(0x80>>(col&7)))?fg:bg;
+            spi_tx(c>>8);spi_tx(c);
+        }
+    CS_HI;
+}
+static void draw_colon(uint16_t color){
+    fill(COL_X,COL_Y1,COL_SZ,COL_SZ,color);
+    fill(COL_X,COL_Y2,COL_SZ,COL_SZ,color);
+}
+static void draw_logo(void){
+    win(8,6,8+LOGO_W-1,6+LOGO_H-1); CS_LO; DC_HI;
+    for(uint16_t i=0;i<LOGO_W*LOGO_H;i++){
+        uint16_t px=pgm_read_word(&logo[i]);
+        spi_tx(px>>8);spi_tx(px);
+    }
+    CS_HI;
+}
+static void draw_battery(uint8_t pct){
+    uint16_t bc=(pct>30)?I_BAT_OK:I_BAT_LOW;
+    uint16_t tc=(pct>30)?C_DARK:I_BAT_LOW;
+    uint16_t bw=(uint16_t)(43*pct/100);
+    if(bw>43)bw=43;
+    fill(245,6,43,10,I_TOPFILL);
+    if(bw>0) fill(245,6,bw,10,bc);
+    fill(291,3,30,16,I_TOPFILL);
+    if(pct>=100){numw_bold(291,4,100,3,tc,I_TOPFILL,1);}
+    else if(pct>=10){numw_bold(291,4,pct,2,tc,I_TOPFILL,1);dtext_bold(304,4,"%",tc,I_TOPFILL,1);}
+    else            {numw_bold(298,4,pct,1,tc,I_TOPFILL,1);dtext_bold(304,4,"%",tc,I_TOPFILL,1);}
+}
+static void draw_battery_border(void){
+    fill(244,5,46,12,I_TOPFILL);
+    hline(244,5,46,I_RULE); hline(244,16,46,I_RULE);
+    fill(244,5,1,12,I_RULE); fill(289,5,1,12,I_RULE);
+    fill(290,8,3,6,I_RULE);
+}
+
+/* Topbar — shows logo, unit mode, battery */
+static void draw_topbar(void){
+    fill(0,0,SCR_W,TB_H,I_TOPFILL);
+    hline(0,TB_H-1,SCR_W,I_BLUE);
+    draw_logo();
+    dtext(160,6,(*MM_IF==0x00)?"MM  ":"INCH",I_MID,I_TOPFILL,1);
+    dtext(200,6,"BAT",I_MID,I_TOPFILL,1);
+    draw_battery_border();
+    draw_battery(disp_batt);
+}
+
+/* Show the actual measurement value on TFT */
+void DISPLAY(void){
+    uint16_t val=*uiLCD_LM;
+    uint8_t d0=(val/1000)%10, d1=(val/100)%10;
+    uint8_t d2=(val/10)%10,   d3= val%10;
+    if(d0!=p0){draw_digit_pgm(D0_X,DIG_Y,d0,C_DARK,WHITE);p0=d0;}
+    if(d1!=p1){draw_digit_pgm(D1_X,DIG_Y,d1,C_DARK,WHITE);p1=d1;}
+    if(d2!=p2){draw_digit_pgm(D2_X,DIG_Y,d2,C_DARK,WHITE);p2=d2;}
+    if(d3!=p3){draw_digit_pgm(D3_X,DIG_Y,d3,C_DARK,WHITE);p3=d3;}
+    /* decimal point indicator */
+    if(DP_1){dtext(D1_X+DIG_W+2,DIG_Y+DIG_H-10,".",C_BLUE,WHITE,2);}
+    if(DP_2){dtext(D2_X+DIG_W+2,DIG_Y+DIG_H-10,".",C_BLUE,WHITE,2);}
+    draw_colon(ECHO_F?C_DARK:WHITE);
+}
+
+/* Draw full instrument UI frame */
+static void draw_instrument_ui(void){
+    fill(0,0,SCR_W,SCR_H,WHITE);
+    draw_topbar();
+    /* content area border box */
+    hline(BOX_X,BOX_Y,BOX_W,C_RULE);
+    hline(BOX_X,BOX_Y+BOX_H,BOX_W,C_RULE);
+    fill(BOX_X,BOX_Y,1,BOX_H,C_RULE);
+    fill(BOX_X+BOX_W-1,BOX_Y,1,BOX_H,C_RULE);
+    dtext(BOX_X+6,BOX_Y+5,"THICKNESS",I_MID,WHITE,1);
+    dtext(BOX_X+6,BOX_Y+BOX_H-12,
+          (*MM_IF==0x00)?"Unit: mm":"Unit: inch",I_MID,WHITE,1);
+    /* hint bar */
+    fill(0,HB_Y,SCR_W,HB_H,I_TOPFILL);
+    hline(0,HB_Y,SCR_W,I_RULE);
+    dtext(8,HB_Y+6,"K5:PROBE  K6:CAL  K3:MM/IN  K8:DIAG",I_DARK,I_TOPFILL,1);
+    /* force all digits to redraw */
+    p0=p1=p2=p3=pc=0xFF;
+    DISPLAY();
+}
+
+/* Called from old code where DATA_LCD() was — now just calls DISPLAY() */
+void DATA_LCD(void){ DISPLAY(); }
+
+/* Old LCD clear → clear TFT content area */
+void CLEAR_LCD(void){
+    fill(0,CA_Y,SCR_W,CA_H,WHITE);
+    p0=p1=p2=p3=pc=0xFF;
+}
+void CLEAR_LCD_ISR(void){ tft_clear_isr(); }
+
+/* ================================================================
+   POWER OFF INTERRUPT  (PA0 falling edge)
+   ================================================================ */
+ISR(PORTA_PORT_vect){
+    if(PORTA.INTFLAGS&INT_PIN){
+        PORTA.INTFLAGS=INT_PIN;
+        if(!(PORTA.IN&INT_PIN)){
+            CLEAR_LCD_ISR();
+            SUM_S();
+            P_10_0;
+            while(1);
+        }
+    }
+}
+
+/* ================================================================
+   LOW BATTERY  (adapted from old code — uses disp_batt for TFT)
+   ================================================================ */
+void LO_BATT(void){
+    ucBATT--;
+    if(ucBATT!=0) return;
+    if(UP_DATE==0x01){
+        ucAUTO++;
+        if(ucAUTO==0x9A){
+            SUM_S(); P_10_0;
+            while(1);
+        }
+    } else {
+        ucAUTO=0x00;
+    }
+    ucBATT=0x02;
+    /* Update displayed battery level from PA6 */
+    if(READ_L_BATT){
+        if(disp_batt>0) disp_batt--;
+        draw_battery(disp_batt);
+    }
+}
+
+/* ================================================================
+   PROBE — zero calibration  (replaces push button with K5)
+   ================================================================ */
+void PROBE(void){
+    *uiVELO_12=0x1720;
+    CYCLE();
+    if(ECHO_F==0x00){ulCY=0x000DFD;return;}
+    *ulDELTA=ulReadCnt-0x000DFD;
+    *once_8=1;
+    EEPROM_SaveCalibration();
+    /* Show "PROBE OK" on TFT briefly */
+    fill(BOX_X+10,BOX_Y+40,BOX_W-20,30,WHITE);
+    dtext(BOX_X+40,BOX_Y+50,"PROBE OK",C_BLUE,WHITE,2);
+    DELAYL(0x20);
+    CLEAR_LCD();
+}
+
+/* ================================================================
+   VELOCITY / CALIBRATION  (adapted from old code)
+   ================================================================ */
+void INCREMENT(void){
+    *uiVELO_12+=1; if(*uiVELO_12>=0x270F)*uiVELO_12=0x270F;
+}
+void DECREMENT(void){
+    *uiVELO_12-=1; if(*uiVELO_12<=0x3E8)*uiVELO_12=0x03E8;
+}
+void F_INC(void){
+    *uiVELO_12+=2; if(*uiVELO_12>=0x270F)*uiVELO_12=0x270F;
+}
+void F_DEC(void){
+    *uiVELO_12-=2; if(*uiVELO_12<=0x3E8)*uiVELO_12=0x03E8;
+}
+uint8_t CK_C(void){ CMP_CAL(); return (uint8_t)*uiLCD_LM; }
+void DIR_C(void){ DIR_CAL(); DISPLAY(); }
+
+void VE_DISP(void){
+    uint32_t ulM; uint16_t uiD;
+    if(*MM_IF==0x00){
+        fill(BOX_X+10,BOX_Y+20,BOX_W-20,20,WHITE);
+        dtext(BOX_X+10,BOX_Y+22,"VEL (m/s):",I_MID,WHITE,1);
+        numw(BOX_X+80,BOX_Y+22,*uiVELO_12,4,C_DARK,WHITE,1);
+        return;
+    }
+    ulM=MUL32(*uiVELO_12,0x0064);
+    uiD=DIV32(ulM,0x00FE);
+    fill(BOX_X+10,BOX_Y+20,BOX_W-20,20,WHITE);
+    dtext(BOX_X+10,BOX_Y+22,"VEL (in/s):",I_MID,WHITE,1);
+    numw(BOX_X+84,BOX_Y+22,uiD,4,C_DARK,WHITE,1);
+}
+
+/* VE_DNC / VE_UPC: use TTP keys instead of push buttons */
+void VE_DNC(void){
+    uint8_t ucCount=0x65;
+    uint8_t k;
+    while(1){
+        F_INC();
+        if(CK_C()==TEMP) if(*uiVELO_12!=0x270F) continue;
+        DIR_C();
+        if(ucCount!=0x01) ucCount-=0x02;
+        DLY_LOG(ucCount);
+        k=ttp_read();
+        if(!(k&K_UP)) break;
+    }
+}
+void VE_UPC(void){
+    uint8_t ucCount=0x65;
+    uint8_t k;
+    while(1){
+        F_DEC();
+        if(CK_C()==TEMP) if(*uiVELO_12!=0x03E8) continue;
+        DIR_C();
+        if(ucCount!=0x01) ucCount-=0x02;
+        DLY_LOG(ucCount);
+        k=ttp_read();
+        if(!(k&K_DN)) break;
+    }
+}
+
+void DIS_T(void){
+    uint16_t i; uint8_t k,pk=0;
+    while(1){
+        for(i=0;i<0xA0;i++){
+            k=ttp_read(); uint8_t np=k&~pk; pk=k;
+            if(np&K_UP){VE_DNC();break;}
+            if(np&K_DN){VE_UPC();break;}
+            if(np&K_CAL){
+                DELAYL(0xFF); DELAYL(0xFF);
+                k=ttp_read();
+                if(k&K_CAL){
+                    VELO();
+                    DP_1=0x01; ECHO_F=0x00; DIR_C();
+                    return;
+                }
+            }
+            DELAYD(0x20);
+        }
+        if(i==0xA0) break;
+    }
+    ECHO_F=0x00; DIR_C();
+}
+
+void DIST_C(void){
+    ECHO_F=0x01;
+    /* Show "CAL" indicator */
+    fill(BOX_X+10,BOX_Y+20,BOX_W-20,20,WHITE);
+    dtext(BOX_X+10,BOX_Y+22,"CALIBRATING...",C_BLUE,WHITE,1);
+    DIR_C();
+    DELAYL(0xFF);
+    DIS_T();
+    EEPROM_SaveCalibration();
+}
+
+void VE_UP(void){
+    uint8_t ucCount=0x65; uint8_t k;
+    while(1){
+        INCREMENT();
+        if(*MM_IF==0x01){INCREMENT();INCREMENT();}
+        VE_DISP();
+        if(ucCount!=0x01) ucCount-=0x02;
+        DLY_LOG(ucCount);
+        k=ttp_read();
+        if(!(k&K_UP)) break;
+    }
+}
+void VE_DN(void){
+    uint8_t ucCount=0x65; uint8_t k;
+    while(1){
+        DECREMENT();
+        if(*MM_IF==0x01){DECREMENT();DECREMENT();}
+        VE_DISP();
+        if(ucCount!=0x01) ucCount-=0x02;
+        DLY_LOG(ucCount);
+        k=ttp_read();
+        if(!(k&K_DN)) break;
+    }
+}
+void VELO(void){
+    uint16_t i; uint8_t k,pk=0;
+    VE_DISP();
+    while(1){
+        for(i=0;i<0xFF;i++){
+            DELAYL(0x20);
+            k=ttp_read(); uint8_t np=k&~pk; pk=k;
+            if(np&K_UP){VE_UP();break;}
+            if(np&K_DN){VE_DN();break;}
+        }
+        if(i==0xFF) break;
+    }
+}
+
+/* ================================================================
+   MM/INCH TOGGLE — K3 replaces UP key from old IN_MM()
+   ================================================================ */
+void IN_MM(void){
+    uint8_t k,pk=0;
+    /* Show current mode */
+    fill(BOX_X+10,BOX_Y+20,BOX_W-20,30,WHITE);
+    dtext(BOX_X+10,BOX_Y+28,(*MM_IF==0x00)?"Mode: MM":"Mode: INCH",C_DARK,WHITE,2);
+    /* Wait for K3 release */
+    while(ttp_read()&K_MM);
+    DELAY(0x20);
+    while(1){
+        k=ttp_read(); uint8_t np=k&~pk; pk=k;
+        if(np&K_MM){
+            *MM_IF=(*MM_IF==0x00)?0x01:0x00;
+            fill(BOX_X+10,BOX_Y+20,BOX_W-20,30,WHITE);
+            dtext(BOX_X+10,BOX_Y+28,(*MM_IF==0x00)?"Mode: MM":"Mode: INCH",C_DARK,WHITE,2);
+            while(ttp_read()&K_MM);
+            DELAY(0x20);
+        }
+        if(np&K_PROBE){ /* K5 = confirm */
+            while(ttp_read()&K_PROBE);
+            DELAY(0x20);
+            break;
+        }
+    }
+    if(*MM_IF==0x01){DP_1=0x00;DP_2=0x01;}
+    else             {DP_1=0x01;DP_2=0x00;}
+    EEPROM_SaveCalibration();
+}
+
+/* ================================================================
+   THNESS — measurement pipeline  (identical to old code)
+   ================================================================ */
+void THNESS(void){
+    CYCLE();
+    if(ECHO_F==0x01){
+        UP_DATE=0x00;
+        SUBDELTA();
+        DIR_CAL();
+        DISPLAY();     /* ← replaces old DELAYL+return */
+        DELAYL(0x30);
+        return;
+    }
+    if(UP_DATE==0x00){
+        DISPLAY();
+        UP_DATE=0x01;
+    }
+}
+
+/* ================================================================
+   STARTUP INIT  (identical logic, TFT instead of segment LCD)
+   ================================================================ */
+void INIT(void){
+    *once_8=0;
+    P_10_1; ECHO_1; CLK_10_1;
+    ucAUTO=0x00; UP_DATE=0x00;
+    MCLOCK_0; COU_R_0;
+    DP_1=0x01; DP_2=0x00; *MM_IF=0x00;
+    ulCY=0x000DFD; ECHO_F=0x00; ucBATT=0x0A; disp_batt=100;
+    *uiVELO_12=0x1720; *ulDELTA=0x017600; *uiLCD_LM=0;
+    *ucPOW=0xAA;
+}
+void INIT_M(void){
+    P_10_1; ECHO_1; CLK_10_1;
+    ucAUTO=0x00; UP_DATE=0x00;
+    MCLOCK_0; COU_R_0;
+    DP_1=0x01; DP_2=0x00; disp_batt=100;
+    if(*MM_IF==0x01){DP_1=0x00;DP_2=0x01;}
+    ECHO_F=0x00; ucBATT=0x0A;
+}
+
+/* ================================================================
+   TFT SPLASH SEQUENCE  (replaces SCROL)
+   ================================================================ */
+static void run_splash(void){
+    /* Draw EDISON II bitmap while dark */
+    win(0,0,SCR_W-1,SCR_H-1); CS_LO; DC_HI;
+    for(uint16_t row=0;row<SCR_H;row++){
+        uint16_t rb=row*SP_BPR;
+        for(uint8_t b=0;b<SP_BPR;b++) sp_row[b]=pgm_read_byte(&sp_bmp[rb+b]);
+        for(uint8_t b=0;b<SP_BPR;b++){
+            uint8_t v=sp_row[b];
+            spi_tx((v&0x80)?0:0xFF);spi_tx((v&0x80)?0:0xFF);
+            spi_tx((v&0x40)?0:0xFF);spi_tx((v&0x40)?0:0xFF);
+            spi_tx((v&0x20)?0:0xFF);spi_tx((v&0x20)?0:0xFF);
+            spi_tx((v&0x10)?0:0xFF);spi_tx((v&0x10)?0:0xFF);
+            spi_tx((v&0x08)?0:0xFF);spi_tx((v&0x08)?0:0xFF);
+            spi_tx((v&0x04)?0:0xFF);spi_tx((v&0x04)?0:0xFF);
+            spi_tx((v&0x02)?0:0xFF);spi_tx((v&0x02)?0:0xFF);
+            spi_tx((v&0x01)?0:0xFF);spi_tx((v&0x01)?0:0xFF);
+        }
+    }
+    CS_HI;
+    for(uint8_t i=0;i<20;i++) _delay_ms(100);   /* hold 2 seconds */
+    /* Fade out */
+    lcd_cmd(0x53);lcd_dat(0x2C); lcd_cmd(0x51);lcd_dat(0xFF);
+    for(int16_t b=255;b>=0;b-=8){lcd_cmd(0x51);lcd_dat((uint8_t)b);delay_ms(18);}
+    lcd_cmd(0x51);lcd_dat(0x00);
+    /* Draw instrument UI while dark */
+    draw_instrument_ui();
+    /* Fade in */
+    for(uint16_t b=0;b<=255;b+=8){lcd_cmd(0x51);lcd_dat((uint8_t)b);delay_ms(18);}
+    lcd_cmd(0x51);lcd_dat(0xFF);
+    lcd_cmd(0x53);lcd_dat(0x00);  /* restore display pipeline */
+}
+
+/* ================================================================
+   DIAGNOSTIC HMI  (identical to previous version)
+   ================================================================ */
+static void topbar_diag(const char *t){
+    fill(0,0,SCR_W,TB_H,I_TOPFILL);
+    hline(0,TB_H-1,SCR_W,I_BLUE);
+    dtext(16,6,t,C_DARK,I_TOPFILL,1);
+    uint32_t s=uptime/33;
+    numw(248,6,(uint16_t)(s/3600),2,C_MID,I_TOPFILL,1);
+    glyph(260,6,':',C_MID,I_TOPFILL,1);
+    numw(266,6,(uint16_t)((s/60)%60),2,C_MID,I_TOPFILL,1);
+    glyph(278,6,':',C_MID,I_TOPFILL,1);
+    numw(284,6,(uint16_t)(s%60),2,C_MID,I_TOPFILL,1);
+}
+static void uptime_tick(void){
+    uint32_t s=uptime/33;
+    numw(248,6,(uint16_t)(s/3600),2,C_MID,I_TOPFILL,1);
+    glyph(260,6,':',C_MID,I_TOPFILL,1);
+    numw(266,6,(uint16_t)((s/60)%60),2,C_MID,I_TOPFILL,1);
+    glyph(278,6,':',C_MID,I_TOPFILL,1);
+    numw(284,6,(uint16_t)(s%60),2,C_MID,I_TOPFILL,1);
+}
+static void hintbar(const char *m){
+    fill(0,HB_Y,SCR_W,HB_H,I_TOPFILL);
+    hline(0,HB_Y,SCR_W,I_RULE);
+    dtext(16,HB_Y+6,m,C_DARK,I_TOPFILL,1);
+}
+
+/* ── Diagnostic splash ─────────────────────────────── */
+static void diag_splash(void){
+    fill(0,0,SCR_W,SCR_H,WHITE);
+    fill(0,0,SCR_W,4,C_BLUE); fill(0,SCR_H-4,SCR_W,4,C_BLUE);
+    fill(0,0,4,SCR_H,C_BLUE); fill(SCR_W-4,0,4,SCR_H,C_BLUE);
+    dtext(92,36,"MODSONIC INSTRUMENTS",C_MID,WHITE,1);
+    fill(32,50,256,2,C_RULE);
+    dtext(44,60,"EDISON-II",C_DARK,WHITE,3);
+    fill(32,92,256,2,C_RULE);
+    dtext(60,100,"Diagnostic Panel  v3.0",C_DARK,WHITE,1);
+    fill(60,148,200,26,C_LIGHT);
+    fill(60,148,200,1,C_RULE);fill(60,173,200,1,C_RULE);
+    fill(60,148,1,26,C_RULE); fill(259,148,1,26,C_RULE);
+    dtext(76,155,"Press KEY-5 for Menu",C_BLUE,C_LIGHT,1);
+}
+
+/* ── Diagnostic menu ───────────────────────────────── */
+static const char *MLABEL[5]={"Brightness Control","Button Test","Volume Control","System Info","Exit to Measurement"};
+static const char *MSUB[5]={"Adjust display brightness","Test all 8 keypad inputs","Adjust simulated volume","Device and runtime info","Return to thickness measurement"};
+static const uint8_t MPAGE[5]={SCR_BRIGHT,SCR_BTNTEST,SCR_VOLUME,SCR_ABOUT,0xFF};
+
+static void draw_menu_row(uint8_t i){
+    uint16_t ry=CA_Y+(uint16_t)i*40;
+    uint8_t sel=(i==menu_cur);
+    uint16_t bg=sel?C_LIGHT:WHITE;
+    fill(0,ry,SCR_W,40,bg);
+    hline(0,ry+39,SCR_W,C_RULE);
+    fill(0,ry,4,40,sel?C_BLUE:C_RULE);
+    dtext(14,ry+8, MLABEL[i],C_DARK,bg,1);
+    dtext(14,ry+22,MSUB[i],  C_MID, bg,1);
+    if(sel) fill(SCR_W-10,ry+16,6,8,C_BLUE);
+}
+static void show_menu(void){
+    topbar_diag("Diagnostic Menu");
+    fill(0,CA_Y,SCR_W,CA_H,WHITE);
+    for(uint8_t i=0;i<5;i++) draw_menu_row(i);
+    hintbar("K1 Up   K2 Down   K5 Select   K6 Back");
+}
+static void menu_move(uint8_t old){draw_menu_row(old);draw_menu_row(menu_cur);}
+
+/* ── Brightness ────────────────────────────────────── */
+#define BR_BX 16
+#define BR_BY (CA_Y+74)
+#define BR_BW 288
+#define BR_BH  20
+static void draw_bright_ui(void){
+    fill(BR_BX,BR_BY,BR_BW,BR_BH,I_TOPFILL);
+    hline(BR_BX,BR_BY,BR_BW,C_MID);
+    hline(BR_BX,BR_BY+BR_BH-1,BR_BW,C_MID);
+    fill(BR_BX,BR_BY,1,BR_BH,C_MID); fill(BR_BX+BR_BW-1,BR_BY,1,BR_BH,C_MID);
+    uint16_t fw=(uint16_t)bright_val*(BR_BW-2)/15;
+    fill(BR_BX+1,BR_BY+1,BR_BW-2,BR_BH-2,I_TOPFILL);
+    if(fw) fill(BR_BX+1,BR_BY+1,fw,BR_BH-2,C_BLUE);
+    for(uint8_t t=0;t<=15;t++) fill(BR_BX+(uint16_t)t*(BR_BW/15),BR_BY+BR_BH+1,1,4,C_RULE);
+    fill(126,BR_BY+32,78,22,WHITE);
+    numw(136,BR_BY+32,bright_val,2,C_DARK,WHITE,3);
+    dtext(184,BR_BY+40,"/15",C_MID,WHITE,1);
+}
+static void show_bright(void){
+    topbar_diag("Brightness Control");
+    fill(0,CA_Y,SCR_W,CA_H,WHITE);
+    dtext(16,CA_Y+16,"Display Brightness",C_DARK,WHITE,2);
+    hline(16,CA_Y+38,288,C_RULE);
+    dtext(16,CA_Y+46,"Adjust the backlight level using K1 and K2.",C_MID,WHITE,1);
+    dtext(16,BR_BY+BR_BH+6,"Low",C_MID,WHITE,1);
+    dtext(274,BR_BY+BR_BH+6,"High",C_MID,WHITE,1);
+    draw_bright_ui();
+    hintbar("K1 Increase   K2 Decrease   K6 Back");
+}
+
+/* ── Button test ───────────────────────────────────── */
+static const char *BTN_NAME[8]={"UP","DN","MM","--","PRB","CAL","---","DIAG"};
+static void draw_btn_tile(uint8_t k,uint8_t pressed){
+    uint16_t tx=4+(uint16_t)(k%4)*79;
+    uint16_t ty=CA_Y+4+(uint16_t)(k/4)*96;
+    uint16_t tw=73,th=90;
+    if(pressed){
+        fill(tx,ty,tw,th,C_BLUE);
+        fill(tx,ty,tw,14,C_DARK);
+        glyph(tx+tw-10,ty+4,'1'+k,WHITE,C_DARK,1);
+        dtext(tx+4,ty+4,"KEY",C_RULE,C_DARK,1);
+        dtext(tx+4,ty+22,BTN_NAME[k],WHITE,C_BLUE,2);
+        hline(tx+4,ty+54,tw-8,WHITE);
+        dtext(tx+4,ty+58,"CNT",WHITE,C_BLUE,1);
+        numw(tx+28,ty+58,key_cnt[k],4,WHITE,C_BLUE,1);
+        if(key_hold[k]>12){fill(tx+4,ty+70,tw-8,16,WHITE);dtext(tx+20,ty+74,"HOLD",C_BLUE,WHITE,1);}
+    } else {
+        fill(tx,ty,tw,th,WHITE);
+        hline(tx,ty,tw,C_MID);hline(tx,ty+th-1,tw,C_MID);
+        fill(tx,ty,1,th,C_MID);fill(tx+tw-1,ty,1,th,C_MID);
+        fill(tx+1,ty+1,tw-2,13,I_TOPFILL);
+        hline(tx+1,ty+14,tw-2,C_MID);
+        dtext(tx+4,ty+4,"KEY",C_MID,I_TOPFILL,1);
+        glyph(tx+tw-10,ty+4,'1'+k,C_DARK,I_TOPFILL,1);
+        dtext(tx+4,ty+22,BTN_NAME[k],C_DARK,WHITE,2);
+        hline(tx+4,ty+54,tw-8,C_RULE);
+        dtext(tx+4,ty+58,"CNT",C_MID,WHITE,1);
+        numw(tx+28,ty+58,key_cnt[k],4,C_MID,WHITE,1);
+    }
+}
+static void show_btntest(void){
+    topbar_diag("Button Test");
+    fill(0,CA_Y,SCR_W,CA_H,WHITE);
+    prev_disp=0;
+    for(uint8_t k=0;k<8;k++) draw_btn_tile(k,0);
+    hintbar("Press any key to test   K6 Back");
+}
+static void btntest_update(uint8_t keys){
+    uint8_t changed=keys^prev_disp;
+    for(uint8_t k=0;k<8;k++)
+        if(changed&(1<<k)) draw_btn_tile(k,(keys>>k)&1);
+    prev_disp=keys;
+}
+
+/* ── Volume ────────────────────────────────────────── */
+#define VL_BX 16
+#define VL_BY (CA_Y+74)
+#define VL_BW 288
+#define VL_BH  20
+static void draw_vol_ui(void){
+    fill(VL_BX,VL_BY,VL_BW,VL_BH,I_TOPFILL);
+    hline(VL_BX,VL_BY,VL_BW,C_MID);
+    hline(VL_BX,VL_BY+VL_BH-1,VL_BW,C_MID);
+    fill(VL_BX,VL_BY,1,VL_BH,C_MID); fill(VL_BX+VL_BW-1,VL_BY,1,VL_BH,C_MID);
+    uint16_t fw=(uint16_t)vol_val*(VL_BW-2)/100;
+    fill(VL_BX+1,VL_BY+1,VL_BW-2,VL_BH-2,I_TOPFILL);
+    if(fw) fill(VL_BX+1,VL_BY+1,fw,VL_BH-2,C_BLUE);
+    for(uint8_t t=0;t<=10;t++) fill(VL_BX+(uint16_t)t*(VL_BW/10),VL_BY+VL_BH+1,1,4,C_RULE);
+    fill(120,VL_BY+32,96,22,WHITE);
+    numw(132,VL_BY+32,vol_val,3,C_DARK,WHITE,3);
+    dtext(198,VL_BY+40,"%",C_MID,WHITE,1);
+}
+static void show_volume(void){
+    topbar_diag("Volume Control");
+    fill(0,CA_Y,SCR_W,CA_H,WHITE);
+    dtext(16,CA_Y+16,"Volume Level",C_DARK,WHITE,2);
+    hline(16,CA_Y+38,288,C_RULE);
+    dtext(16,CA_Y+46,"Adjust using K3 and K4.",C_MID,WHITE,1);
+    draw_vol_ui();
+    hintbar("K3 Decrease   K4 Increase   K6 Back");
+}
+
+/* ── System info ───────────────────────────────────── */
+static void show_about(void){
+    topbar_diag("System Info");
+    fill(0,CA_Y,SCR_W,CA_H,WHITE);
+    fill(0,CA_Y+8,SCR_W,16,I_TOPFILL);
+    hline(0,CA_Y+8,SCR_W,C_RULE); hline(0,CA_Y+24,SCR_W,C_RULE);
+    dtext(16,CA_Y+12,"DEVICE",C_DARK,I_TOPFILL,1);
+    static const char *DK[6]={"MCU","Clock","TFT","Keypad","Resolution","FW"};
+    static const char *DV[6]={"AVR128DA48","24 MHz","ST7789VI","TTP229","320x240","v3.0.0"};
+    for(uint8_t i=0;i<6;i++){
+        uint16_t dy=CA_Y+28+(uint16_t)i*16;
+        uint16_t rb=i%2?WHITE:(uint16_t)0xF7BE;
+        fill(0,dy,SCR_W,16,rb);
+        dtext(16,dy+4,DK[i],C_MID,rb,1);
+        fill(110,dy,1,16,C_RULE);
+        dtext(118,dy+4,DV[i],C_DARK,rb,1);
+        hline(0,dy+15,SCR_W,C_RULE);
+    }
+    fill(0,CA_Y+124,SCR_W,16,I_TOPFILL);
+    hline(0,CA_Y+124,SCR_W,C_RULE); hline(0,CA_Y+140,SCR_W,C_RULE);
+    dtext(16,CA_Y+128,"MEASUREMENT",C_DARK,I_TOPFILL,1);
+    dtext(16,CA_Y+144,"Velocity:",C_MID,WHITE,1);
+    numw(80,CA_Y+144,*uiVELO_12,4,C_DARK,WHITE,1);
+    dtext(16,CA_Y+160,"Mode:",C_MID,WHITE,1);
+    dtext(56,CA_Y+160,(*MM_IF==0x00)?"MM":"INCH",C_DARK,WHITE,1);
+    dtext(16,CA_Y+176,"Reading:",C_MID,WHITE,1);
+    numw(70,CA_Y+176,*uiLCD_LM,4,C_DARK,WHITE,1);
+    hintbar("K6 Back");
+}
+
+/* ── Diag router ───────────────────────────────────── */
+static void diag_go(uint8_t p){
+    if(diag_page==SCR_BRIGHT && p!=SCR_BRIGHT) lcd_cmd(0x53),lcd_dat(0x00);
+    diag_page=p;
+    switch(p){
+        case SCR_DMENU:   show_menu();                              break;
+        case SCR_BRIGHT:  apply_bright(bright_val); show_bright();  break;
+        case SCR_BTNTEST: show_btntest();                           break;
+        case SCR_VOLUME:  show_volume();                            break;
+        case SCR_ABOUT:   show_about();                             break;
+        default:          show_menu();                              break;
+    }
+}
+
+/* ================================================================
+   HARDWARE INIT
+   ================================================================ */
+static void clk24(void){
+    CPU_CCP=CCP_IOREG_gc;
+    CLKCTRL.OSCHFCTRLA=CLKCTRL_FRQSEL_24M_gc;
+}
+static void hw_init(void){
+    /* Power latch — hold power on immediately */
+    PORTA.DIRSET=P_10_PIN;
+    PORTA.OUTSET=P_10_PIN;   /* latch ON — keep power */
+    /* Power button input */
+    PORTA.DIRCLR=SW_P_PIN;
+    PORTA.PIN0CTRL=PORT_PULLUPEN_bm|PORT_ISC_FALLING_gc;
+    /* TFT SPI control pins */
+    PORTD.DIRSET=PIN0_bm|PIN1_bm|PIN2_bm|PIN3_bm|PIN4_bm|PIN5_bm;
+    PORTD.OUTSET=PIN0_bm|PIN1_bm|PIN2_bm;   /* DC/RST/CS idle high */
+    PORTD.OUTCLR=PIN3_bm|PIN4_bm|PIN5_bm;
+    /* SPI MOSI=PA4, SCK=PA6, MISO=PA5(in), PA7(out) */
+    PORTA.DIRSET=PIN4_bm|PIN6_bm|PIN7_bm;
+    PORTA.DIRCLR=PIN5_bm;
+    /* TTP229: SCL=PB1 output high idle, SDO=PB0 input */
+    PORTB.DIRSET=PIN1_bm; PORTB.OUTSET=PIN1_bm;
+    PORTB.DIRCLR=PIN0_bm; PORTB.PIN0CTRL=PORT_PULLUPEN_bm;
+    /* Counter inputs — adjust per new PCB routing */
+    PORTB.DIRCLR=PIN2_bm|PIN3_bm|PIN4_bm|PIN5_bm;
+    PORTB.PIN2CTRL=PORT_PULLUPEN_bm; PORTB.PIN3CTRL=PORT_PULLUPEN_bm;
+    PORTB.PIN4CTRL=PORT_PULLUPEN_bm; PORTB.PIN5CTRL=PORT_PULLUPEN_bm;
+    PORTC.DIRCLR=PIN4_bm|PIN5_bm|PIN6_bm|PIN7_bm;
+    PORTC.PIN4CTRL=PORT_PULLUPEN_bm; PORTC.PIN5CTRL=PORT_PULLUPEN_bm;
+    PORTC.PIN6CTRL=PORT_PULLUPEN_bm; PORTC.PIN7CTRL=PORT_PULLUPEN_bm;
+    PORTA.DIRCLR=PIN1_bm|PIN2_bm|PIN3_bm;
+    PORTA.PIN1CTRL=PORT_PULLUPEN_bm;
+    PORTA.PIN2CTRL=PORT_PULLUPEN_bm;
+    PORTA.PIN3CTRL=PORT_PULLUPEN_bm;
+    PORTF.DIRCLR=PIN1_bm; PORTF.PIN1CTRL=PORT_PULLUPEN_bm;
+    /* Echo + ultrasonic outputs */
+    PORTF.DIRSET=PIN0_bm;
+    /* TCB0 timer */
+    TCB0.CTRLB=TCB_CNTMODE_INT_gc;
+    TCB0.CTRLA=TCB_CLKSEL_DIV1_gc;
+    /* SPI */
+    SPI0.CTRLB=SPI_SSD_bm;
+    SPI0.CTRLA=SPI_MASTER_bm|SPI_ENABLE_bm|SPI_CLK2X_bm|SPI_PRESC_DIV4_gc;
+}
+
+/* ================================================================
+   MAIN
+   ================================================================ */
+int main(void){
+    clk24();
+    hw_init();
+
+    /* Init TFT first so display works immediately */
+    lcd_init();
+
+    /* Restore calibration state */
+    if(*ucPOW==0xAA){
+        if(SUM_CK()==0x00) INIT_M();
+        else                INIT();
+    } else {
+        if(EEPROM_ValidateCalibration()==0x00){
+            EEPROM_LoadCalibration(); *ucPOW=0xAA; INIT_M();
+        } else {
+            INIT();
+        }
+    }
+
+    /* TFT splash → fade → instrument UI */
+    run_splash();
+
+    PORTA.INTFLAGS=INT_PIN; sei();   /* enable power button ISR */
+    prev_keys=ttp_read();
+    meas_tick=0; bat_tick=0; uptime=0;
+
+    /* ── MAIN LOOP ──────────────────────────────────── */
+    while(1){
+        uint8_t keys=ttp_read();
+        uint8_t np  =keys&~prev_keys;
+        prev_keys=keys;
+
+        for(uint8_t k=0;k<8;k++){
+            if(keys&(1<<k)){if(key_hold[k]<255)key_hold[k]++;}
+            else key_hold[k]=0;
+            if(np&(1<<k)) key_cnt[k]++;
+        }
+
+        /* K8: toggle diagnostic mode from anywhere — instant, no blocking wait */
+        if(np&K_DIAG){
+            if(mode==0){
+                /* Instrument → Diagnostic: straight to menu */
+                mode=1;
+                diag_go(SCR_DMENU);
+                prev_keys=ttp_read();
+            } else {
+                /* Diagnostic → Instrument: disable brightness if active */
+                if(diag_page==SCR_BRIGHT){ lcd_cmd(0x53); lcd_dat(0x00); }
+                mode=0;
+                draw_instrument_ui();
+                DISPLAY();
+                meas_tick=0;
+                prev_keys=ttp_read();
+            }
+            continue;
+        }
+
+        /* ── MEASUREMENT MODE ────────────────────── */
+        if(mode==0){
+            /* 50ms base tick — keeps K8 responsive */
+            _delay_ms(50);
+            uptime++;
+
+            /* Measurement runs every 5 ticks (~250ms) */
+            if(++meas_tick>=5){
+                meas_tick=0;
+                Timer_Stop();
+                THNESS();          /* ultrasonic measurement + DISPLAY() */
+                Timer_Start(TIMER_VAL_SHORT);
+                while(!Timer_Overflow());
+                TIMER_OVERFLOW();
+            }
+
+            /* Battery display: decrement every 40 ticks (~2s) for demo */
+            if(++bat_tick>=40){
+                bat_tick=0;
+                if(disp_batt>0) disp_batt--;
+                else            disp_batt=100;
+                draw_battery(disp_batt);
+            }
+
+            /* LO_BATT: auto power-off counter (keep original logic) */
+            LO_BATT();
+
+            /* Keys — checked every tick so K8 responds within 50ms */
+            if(np&K_PROBE){
+                Timer_Stop();
+                PROBE();
+                draw_instrument_ui();
+                DISPLAY();
+                continue;
+            }
+            if(np&K_CAL){
+                Timer_Stop();
+                DIST_C();
+                draw_instrument_ui();
+                DISPLAY();
+                continue;
+            }
+            if(np&K_MM){
+                IN_MM();
+                draw_instrument_ui();
+                DISPLAY();
+            }
+
+            /* Refresh uptime in topbar once per second */
+            if(uptime%20==0) uptime_tick();
+        }
+
+        /* ── DIAGNOSTIC MODE ─────────────────────── */
+        else {
+            if(np&K_CAL){  /* K6 = back one level */
+                if(diag_page==SCR_DMENU){
+                    /* Back to instrument from menu */
+                    mode=0;
+                    draw_instrument_ui();
+                    DISPLAY();
+                    meas_tick=0;
+                    prev_keys=ttp_read();
+                } else {
+                    /* Back to diag menu — disable brightness if leaving it */
+                    if(diag_page==SCR_BRIGHT){ lcd_cmd(0x53); lcd_dat(0x00); }
+                    diag_go(SCR_DMENU);
+                }
+                _delay_ms(20); continue;
+            }
+            switch(diag_page){
+                case SCR_DMENU: {
+                    uint8_t oc=menu_cur;
+                    if(np&K_UP){if(menu_cur>0)menu_cur--;}
+                    if(np&K_DN){if(menu_cur<4)menu_cur++;}
+                    if(np&(K_UP|K_DN)) menu_move(oc);
+                    if(np&K_PROBE){
+                        if(MPAGE[menu_cur]==0xFF){
+                            /* "Exit to Measurement" selected */
+                            mode=0; draw_instrument_ui(); DISPLAY();
+                            meas_tick=0; prev_keys=ttp_read(); continue;
+                        }
+                        diag_go(MPAGE[menu_cur]);
+                    }
+                    break;
+                }
+                case SCR_BRIGHT: {
+                    static uint8_t bth=0; bth++;
+                    uint8_t ch=0;
+                    if((np&K_UP)||(bth%5==0&&(keys&K_UP))){if(bright_val<15){bright_val++;ch=1;}}
+                    if((np&K_DN)||(bth%5==0&&(keys&K_DN))){if(bright_val>0) {bright_val--;ch=1;}}
+                    if(ch){apply_bright(bright_val);draw_bright_ui();}
+                    break;
+                }
+                case SCR_BTNTEST:
+                    btntest_update(keys);
+                    break;
+                case SCR_VOLUME: {
+                    uint8_t ch=0;
+                    if(keys&K_MM) {if(vol_val>0)  {vol_val--;ch=1;}}
+                    if(keys&K_RES){if(vol_val<100){vol_val++;ch=1;}}
+                    if(ch) draw_vol_ui();
+                    break;
+                }
+                case SCR_ABOUT:
+                    break;
+            }
+            uptime++;
+            if(uptime%33==0) uptime_tick();
+            _delay_ms(30);
+        }
+    }
+}

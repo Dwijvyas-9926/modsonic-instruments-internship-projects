@@ -1,0 +1,206 @@
+#define F_CPU 24000000UL
+
+#include <avr/io.h>
+#include <avr/cpufunc.h>
+#include <util/delay.h>
+#include <stdint.h>
+
+// ================= LCD CONNECTIONS =================
+
+#define LCD_CLK_PIN    PIN0_bm    // PC0 -> LCLK
+#define LCD_DATA_PIN   PIN1_bm    // PC1 -> LDATA
+
+// ================= TTP229 CONNECTIONS ==============
+
+#define TTP_SCL_PIN    PIN0_bm    // PD0 -> SCL
+#define TTP_SDO_PIN    PIN1_bm    // PD1 -> SDO
+
+#define BIT(x) (1UL << (x))
+
+// ================= SEGMENT MAP =====================
+
+// Digit 1 (rightmost)
+#define SEG_1A   13
+#define SEG_1B   0
+#define SEG_1C   2
+#define SEG_1D   3
+#define SEG_1E   4
+#define SEG_1F   31
+#define SEG_1G   30
+
+// Digit 2
+#define SEG_2A   28
+#define SEG_2B   29
+#define SEG_2C   6
+#define SEG_2D   7
+#define SEG_2E   8
+#define SEG_2F   27
+#define SEG_2G   26
+
+// Digit 3
+#define SEG_3A   24
+#define SEG_3B   25
+#define SEG_3C   10
+#define SEG_3D   11
+#define SEG_3E   12
+#define SEG_3F   23
+#define SEG_3G   22
+
+// Digit 4 (leftmost)
+#define SEG_4A   20
+#define SEG_4B   21
+#define SEG_4C   14
+#define SEG_4D   15
+#define SEG_4E   16
+#define SEG_4F   19
+#define SEG_4G   18
+
+// ================= LCD FUNCTIONS ===================
+
+static inline void DATA_L(uint8_t bit)
+{
+    if (bit)
+        PORTC.OUTSET = LCD_DATA_PIN;
+    else
+        PORTC.OUTCLR = LCD_DATA_PIN;
+
+    _delay_us(100);
+
+    PORTC.OUTSET = LCD_CLK_PIN;
+    _delay_us(100);
+
+    PORTC.OUTCLR = LCD_CLK_PIN;
+    _delay_us(100);
+}
+
+static void SEND_FRAME(uint32_t value)
+{
+    DATA_L(1);
+
+    DATA_L(0);
+    DATA_L(1);
+
+    for (uint8_t i = 0; i < 32; i++)
+    {
+        DATA_L((value >> i) & 1);
+    }
+
+    DATA_L(0);
+    DATA_L(0);
+}
+
+// ================= TTP229 READ =====================
+
+static uint8_t ttp229_read(void)
+{
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        PORTD.OUTCLR = TTP_SCL_PIN;
+        _delay_us(10);
+
+        if (!(PORTD.IN & TTP_SDO_PIN))
+        {
+            PORTD.OUTSET = TTP_SCL_PIN;
+            return i + 1;
+        }
+
+        PORTD.OUTSET = TTP_SCL_PIN;
+        _delay_us(10);
+    }
+
+    return 0;
+}
+
+// ================= DIGIT GENERATOR ================
+
+#define DIGIT_FUNC(name,A,B,C,D,E,F,G)                     \
+static uint32_t name(uint8_t num)                          \
+{                                                          \
+    switch (num)                                           \
+    {                                                      \
+        case 1: return BIT(B) | BIT(C);                   \
+        case 2: return BIT(A)|BIT(B)|BIT(D)|BIT(E)|BIT(G);\
+        case 3: return BIT(A)|BIT(B)|BIT(C)|BIT(D)|BIT(G);\
+        case 4: return BIT(B)|BIT(C)|BIT(F)|BIT(G);       \
+        case 5: return BIT(A)|BIT(C)|BIT(D)|BIT(F)|BIT(G);\
+        case 6: return BIT(A)|BIT(C)|BIT(D)|BIT(E)|BIT(F)|BIT(G);\
+        case 7: return BIT(A)|BIT(B)|BIT(C);              \
+        case 8: return BIT(A)|BIT(B)|BIT(C)|BIT(D)|BIT(E)|BIT(F)|BIT(G);\
+        default: return 0;                                \
+    }                                                      \
+}
+
+DIGIT_FUNC(digit1, SEG_1A, SEG_1B, SEG_1C, SEG_1D, SEG_1E, SEG_1F, SEG_1G)
+DIGIT_FUNC(digit2, SEG_2A, SEG_2B, SEG_2C, SEG_2D, SEG_2E, SEG_2F, SEG_2G)
+DIGIT_FUNC(digit3, SEG_3A, SEG_3B, SEG_3C, SEG_3D, SEG_3E, SEG_3F, SEG_3G)
+DIGIT_FUNC(digit4, SEG_4A, SEG_4B, SEG_4C, SEG_4D, SEG_4E, SEG_4F, SEG_4G)
+
+// ===================== MAIN ========================
+
+int main(void)
+{
+    _PROTECTED_WRITE(CLKCTRL.OSCHFCTRLA,
+                     CLKCTRL_FRQSEL_24M_gc);
+
+    PORTC.DIRSET = LCD_CLK_PIN | LCD_DATA_PIN;
+    PORTC.OUTCLR = LCD_CLK_PIN | LCD_DATA_PIN;
+
+    PORTD.DIRSET = TTP_SCL_PIN;
+    PORTD.DIRCLR = TTP_SDO_PIN;
+
+    PORTD.OUTSET = TTP_SCL_PIN;
+    PORTD.PIN1CTRL = PORT_PULLUPEN_bm;
+
+    uint8_t current_digit = 0;
+    uint8_t last_key = 0;
+    uint8_t last_digit = 0;   // last digit value actually written to the LCD
+
+    while (1)
+    {
+        uint8_t key = ttp229_read();
+
+        // Detect new key press only (rising edge), then confirm with a
+        // debounce re-read 20ms later.
+        if ((key >= 1) && (key <= 8) && (last_key == 0))
+        {
+            _delay_ms(5);
+
+            if (ttp229_read() == key)
+            {
+                current_digit = key;
+            }
+        }
+
+        last_key = key;
+
+        // ---- Transition smoothing --------------------------------------
+        // The LCD has no memory of its own - it must be re-driven on
+        // every refresh cycle below or the image fades out within a
+        // couple of seconds. So we never skip the continuous refresh.
+        // Instead, exactly at the moment the digit changes, we insert one
+        // extra blank "wipe" frame before the new pattern. This avoids
+        // jumping straight from a sparse pattern to a dense one (or vice
+        // versa - worst case is anything <-> 8, where up to 28 of 32
+        // segment bits flip at once), which is what was causing the
+        // glitchy/ghosted transitions.
+        if (current_digit != last_digit)
+        {
+            SEND_FRAME(0);
+            last_digit = current_digit;
+        }
+
+        // ---- Continuous refresh ------------------------------------------
+        // MUST run unconditionally, every loop iteration. Skipping this
+        // when the digit hasn't changed is what caused the display to
+        // fade out after a few seconds.
+        uint32_t pattern =
+              digit1(current_digit)
+            | digit2(current_digit)
+            | digit3(current_digit)
+            | digit4(current_digit);
+
+        SEND_FRAME(pattern);
+
+        _delay_ms(10);
+    }
+}
