@@ -16,7 +16,7 @@ The primary objective was to modernize the user interface of an industrial Ultra
 
 **Location:** Anand, Gujarat, India
 
-**Intern:** Dwij Vyas
+**Intern:** Dwij Vyas & Roshan Mali
 
 **College:** Birla Vishvakarma Mahavidyalaya (BVM)
 
@@ -156,7 +156,7 @@ Any confidential source code, production firmware, PCB designs, proprietary algo
 
 ## Author
 
-**Dwij Vyas**
+**Dwij Vyas & Roshan Mali**
 
 Electronics & Communication Engineering
 
